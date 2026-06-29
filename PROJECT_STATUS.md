@@ -3,6 +3,7 @@
 **Project:** Desktop Agent
 **Phase 1 (Desktop Collector):** COMPLETED
 **Phase 2 (Snapshot Engine):** COMPLETED
+**Phase 3 (Google Sheets Sync Engine V1):** COMPLETED
 **Date:** 2026-06-30
 
 ## What Phase 1 does
@@ -155,9 +156,113 @@ or no matching previous run.
   single-date-range assumption entirely and makes the diff correct
   regardless of per-account timezone drift.
 
+## What Phase 3 adds
+
+Phase 3 syncs the latest collector snapshot from SQLite to a Google Sheets
+tab via the Google Sheets API (service account auth). Scheduling, Telegram
+notifications, and AI-driven analysis remain out of scope. The sync **reads
+only** from SQLite — `pnpm sheets:sync` never invokes the collector itself
+(requirement: no AdsPower/browser access from this command).
+
+**Real integration test (2026-06-30), against the live spreadsheet
+`1_H58WM-u-JiE2quBLettT7Rxik2sky2BvkQq9CWxb8o`, tab `Campaigns`:**
+1. `pnpm sheets:sync -- --dry-run` against an empty sheet planned 5
+   `APPEND`s and wrote nothing (confirmed by re-reading the sheet via the
+   Sheets API — still empty).
+2. `pnpm sheets:sync` created the header row and appended all 5 campaigns
+   from the latest run; confirmed by reading the sheet back directly.
+3. Running `pnpm sheets:sync` again with no new collector run produced
+   `appendedRows: 0, updatedRows: 0, skippedRows: 5`.
+4. A new collector run with exactly one campaign's `status` changed (one
+   row of `NQT-MOMO-QKA-PG3-2906 #2` from `Eligible` to `Paused`) produced
+   `appendedRows: 0, updatedRows: 1, skippedRows: 4`; reading the sheet back
+   confirmed only that row's `status` and `lastSeenRunId` changed, all other
+   rows kept their prior `lastSeenRunId`. This sandbox has no AdsPower
+   client or live Google Ads browser session, so the "next collector run"
+   was produced by writing directly to SQLite via the same `saveRun` path
+   `pnpm dev` uses (not by actually running `pnpm dev`/AdsPower) — the
+   `sheets:sync` side of the test ran for real against the live API.
+
+New env vars:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `GOOGLE_SHEETS_SPREADSHEET_ID` | _(none)_ | Target spreadsheet id; required for `pnpm sheets:sync` |
+| `GOOGLE_SHEETS_CREDENTIALS_PATH` | _(none)_ | Path to a Google service account JSON key file with edit access to the spreadsheet; required for `pnpm sheets:sync` |
+| `GOOGLE_SHEETS_TAB_NAME` | `Campaigns` | Sheet tab name to sync into |
+
+Modules:
+
+- **`SheetsClient`** (`src/infrastructure/sheets/SheetsClient.ts`) — thin
+  wrapper around the `googleapis` Sheets v4 API (service-account
+  `GoogleAuth`). Methods: `readSheet`, `writeHeader`, `appendRows`,
+  `updateRow`. No business logic.
+- **`SheetsSyncPlanner`** (`src/domain/services/SheetsSyncPlanner.ts`) — pure
+  domain module. `decideRowAction(existing, incoming)` is the upsert
+  decision: `APPEND` if the `campaignKey` isn't on the sheet yet, `UPDATE` if
+  it exists and any data column changed, `SKIP` if it exists and every data
+  column is identical (comparison ignores the trailing `lastSeenRunId` /
+  `lastSeenAt` tracking columns, since those always change run-to-run).
+  `planSync(existingRows, incomingRows)` applies that decision across a
+  whole sheet.
+- **`sheetRowMapper`** (`src/domain/services/sheetRowMapper.ts`) — pure row
+  mapper. `SHEET_COLUMNS` defines the 20-column order (see below);
+  `buildSheetRowValues`/`buildSheetRows` map a `SheetSyncCampaign` (+
+  `runId` + `lastSeenAt`) to an ordered string array, converting `null`
+  fields to `""`.
+- **`SheetsSyncExecutor`** (`src/infrastructure/sheets/SheetsSyncExecutor.ts`)
+  — orchestrates `SheetsClient` + `SheetsSyncPlanner`: reads the current
+  sheet, plans actions, and (unless `dryRun`) writes the header if the sheet
+  is empty, batch-appends new rows, and updates changed rows in place by
+  their 1-based sheet row index.
+
+Read path: `SnapshotRepository.getLatestRunForSheetsSync()` (implemented in
+`PrismaSnapshotRepository`) flattens the latest `CollectorRun` into one
+`SheetSyncCampaign` per `CampaignSnapshot`, carrying `providerCode`/
+`dateMode` from the run and `customerId`/`accountName`/`fromDate`/`toDate`
+from the owning `AccountSnapshot`.
+
+Sheet columns, in order: `providerCode`, `dateMode`, `fromDate`, `toDate`,
+`customerId`, `accountName`, `campaignKey`, `campaignName`, `account`,
+`budget`, `status`, `campaignType`, `impressions`, `interactions`,
+`interactionRate`, `avgCost`, `cost`, `conversions`, `lastSeenRunId`,
+`lastSeenAt`.
+
+CLI: `pnpm sheets:sync` (`src/presentation/cli/sheetsSync.ts`) loads the
+latest snapshot, syncs it, and prints
+`{ spreadsheetId, tabName, latestRunId, appendedRows, updatedRows, skippedRows }`.
+`pnpm sheets:sync -- --dry-run` runs the same plan but skips all writes
+(`SheetsClient.writeHeader`/`appendRows`/`updateRow` are never called) and
+additionally prints the full list of planned actions. If
+`GOOGLE_SHEETS_SPREADSHEET_ID` or `GOOGLE_SHEETS_CREDENTIALS_PATH` is unset,
+the CLI prints a clear message and exits non-zero instead of calling the
+Sheets API.
+
+V1 explicitly does not delete rows or mark removed campaigns — that's
+tracked below.
+
+## Known Limitation / Phase 4 Backlog
+
+- **Sheets sync never marks or removes campaigns that disappeared from the
+  latest run.** `pnpm sheets:sync` only appends new `campaignKey`s and
+  updates/skips existing ones; a campaign that was on the sheet from a prior
+  run but is no longer in the latest snapshot is left as-is, with a stale
+  `lastSeenRunId`/`lastSeenAt`. This is explicitly V1 scope (requirement:
+  "Do not delete rows. Do not mark removed campaigns yet"). A future phase
+  should cross-reference `CampaignDiffEngine`'s `REMOVED_CAMPAIGN` change
+  type (already computed by the Diff Engine) to flag or visually mark those
+  sheet rows instead of deleting them outright.
+- **Skip comparison can leave `lastSeenRunId`/`lastSeenAt` stale.** When a
+  row is `SKIP`ped because its data columns are unchanged, the sheet's
+  `lastSeenRunId`/`lastSeenAt` values are *not* updated to the latest run
+  (only the unchanged data columns are preserved). This trades "is this
+  campaign still being seen" tracking accuracy for fewer Sheets API writes.
+  A future phase could cheaply touch just those two columns on skip.
+
 ## Next phase
 
-**Phase 3** — Google Sheets export, scheduling, Telegram notifications, and
-AI-driven analysis remain future phases, to be scoped individually. The
-per-account diff comparability fix described above (Known Limitation /
-Phase 3 Backlog) is also tracked for this phase.
+**Phase 4** — scheduling, Telegram notifications, and AI-driven analysis
+remain future phases, to be scoped individually. The per-account diff
+comparability fix (Known Limitation / Phase 3 Backlog, above the Phase 3
+section) and the Sheets removed-campaign marking (Known Limitation / Phase 4
+Backlog, above) are also tracked for upcoming phases.

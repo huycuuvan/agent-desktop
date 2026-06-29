@@ -2,6 +2,7 @@ import type { AccountSnapshot, CampaignSnapshot, CollectorRun, PrismaClient } fr
 import type { SnapshotRepository } from "../../domain/repositories/SnapshotRepository.js";
 import type { CollectorRunInput, CollectorRunSummary } from "../../domain/entities/CollectorRunSnapshot.js";
 import type { RunWithCampaigns } from "../../domain/entities/CampaignDiff.js";
+import type { LatestRunForSheetsSync } from "../../domain/entities/SheetSync.js";
 
 type CollectorRunWithSnapshots = CollectorRun & {
   accountSnapshots: (AccountSnapshot & { campaignSnapshots: CampaignSnapshot[] })[];
@@ -121,6 +122,42 @@ export class PrismaSnapshotRepository implements SnapshotRepository {
     }
 
     return null;
+  }
+
+  async getLatestRunForSheetsSync(): Promise<LatestRunForSheetsSync | null> {
+    const run = await this.prisma.collectorRun.findFirst({
+      orderBy: { id: "desc" },
+      include: { accountSnapshots: { include: { campaignSnapshots: true } } },
+    });
+
+    if (!run) {
+      return null;
+    }
+
+    const campaigns = run.accountSnapshots.flatMap((account) =>
+      account.campaignSnapshots.map((campaign) => ({
+        campaignKey: campaign.campaignKey,
+        campaignName: campaign.campaignName,
+        account: campaign.account,
+        customerId: account.customerId,
+        accountName: account.accountName,
+        providerCode: run.providerCode,
+        dateMode: run.dateMode,
+        fromDate: account.fromDate,
+        toDate: account.toDate,
+        budget: campaign.budget,
+        status: campaign.status,
+        campaignType: campaign.campaignType,
+        impressions: campaign.impressions,
+        interactions: campaign.interactions,
+        interactionRate: campaign.interactionRate,
+        avgCost: campaign.avgCost,
+        cost: campaign.cost,
+        conversions: campaign.conversions,
+      })),
+    );
+
+    return { runId: run.id, campaigns };
   }
 
   private toRunWithCampaigns(run: CollectorRunWithSnapshots): RunWithCampaigns {

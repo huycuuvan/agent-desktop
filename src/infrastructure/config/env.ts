@@ -13,6 +13,9 @@ const envSchema = z.object({
   GOOGLE_ADS_STABLE_CHECKS: z.coerce.number().int().positive().default(3),
   GOOGLE_ADS_STABLE_INTERVAL_MS: z.coerce.number().int().positive().default(1500),
   LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace"]).default("info"),
+  GOOGLE_SHEETS_SPREADSHEET_ID: z.string().optional(),
+  GOOGLE_SHEETS_CREDENTIALS_PATH: z.string().optional(),
+  GOOGLE_SHEETS_TAB_NAME: z.string().min(1).default("Campaigns"),
 });
 
 export type Env = z.infer<typeof envSchema>;

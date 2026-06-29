@@ -7,6 +7,7 @@
     "dev": "tsx src/presentation/cli/index.ts",
     "snapshot:latest": "tsx src/presentation/cli/snapshotLatest.ts",
     "snapshot:diff": "tsx src/presentation/cli/snapshotDiff.ts",
+    "sheets:sync": "tsx src/presentation/cli/sheetsSync.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/presentation/cli/index.js",
     "prisma:generate": "prisma generate",
@@ -16,6 +17,7 @@
   "dependencies": {
     "@prisma/client": "^5.20.0",
     "dotenv": "^16.4.5",
+    "googleapis": "^173.0.0",
     "pino": "^9.4.0",
     "pino-pretty": "^11.2.2",
     "playwright": "^1.47.0",

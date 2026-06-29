@@ -75,6 +75,38 @@ valid comparison otherwise. See "Known Limitation / Phase 3 Backlog" in
 [PROJECT_STATUS.md](PROJECT_STATUS.md) for the intended fix (comparing
 per-`AccountSnapshot` instead of per-`CollectorRun`).
 
+## Google Sheets sync (Phase 3)
+
+```bash
+pnpm sheets:sync               # syncs the latest collector run to Google Sheets
+pnpm sheets:sync -- --dry-run  # prints the planned changes only, writes nothing
+```
+
+`pnpm sheets:sync` reads only the latest snapshot already stored in SQLite —
+it never invokes the collector itself. It upserts one row per
+`campaignKey` into the configured Google Sheets tab: existing rows are
+updated in place, new campaigns are appended, and rows whose data is
+unchanged since the sheet's current values (ignoring `lastSeenRunId`/
+`lastSeenAt`) are left untouched. Removed campaigns are never deleted from
+the sheet in V1. Requires `GOOGLE_SHEETS_SPREADSHEET_ID` and
+`GOOGLE_SHEETS_CREDENTIALS_PATH` (a Google service account JSON key file
+with edit access to the target spreadsheet) to be set in `.env`; the CLI
+exits with a clear message if either is missing. Prints a JSON summary:
+
+```json
+{
+  "spreadsheetId": "...",
+  "tabName": "Campaigns",
+  "latestRunId": 4,
+  "appendedRows": 0,
+  "updatedRows": 0,
+  "skippedRows": 0
+}
+```
+
+See [PROJECT_STATUS.md](PROJECT_STATUS.md) for the sheet column layout and
+module breakdown (`SheetsClient`, `SheetsSyncPlanner`, `SheetsSyncExecutor`).
+
 ## How to run tests
 
 ```bash
@@ -100,6 +132,8 @@ the full table with defaults. Summary:
 - `GOOGLE_ADS_DATE_MODE` — `TODAY` | `YESTERDAY` | `LAST_2_DAYS` | `AUTO` (default `AUTO`, resolves to `LAST_2_DAYS`).
 - `GOOGLE_ADS_ACTION_DELAY_MS`, `GOOGLE_ADS_TABLE_TIMEOUT_MS`, `GOOGLE_ADS_SETTLE_DELAY_MS`, `GOOGLE_ADS_STABLE_CHECKS`, `GOOGLE_ADS_STABLE_INTERVAL_MS` — tuning knobs for how long/aggressively the collector waits for the Google Ads table to settle (matters most on slow proxies).
 - `LOG_LEVEL` — Pino log level.
+- `GOOGLE_SHEETS_SPREADSHEET_ID` / `GOOGLE_SHEETS_CREDENTIALS_PATH` — required only for `pnpm sheets:sync`; spreadsheet to sync into and the path to a Google service account JSON key file.
+- `GOOGLE_SHEETS_TAB_NAME` — sheet tab name to sync into (default `Campaigns`).
 
 ## Meaning of output fields
 
