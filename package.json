@@ -8,6 +8,7 @@
     "snapshot:latest": "tsx src/presentation/cli/snapshotLatest.ts",
     "snapshot:diff": "tsx src/presentation/cli/snapshotDiff.ts",
     "sheets:sync": "tsx src/presentation/cli/sheetsSync.ts",
+    "agent:start": "tsx src/presentation/cli/agentStart.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/presentation/cli/index.js",
     "prisma:generate": "prisma generate",

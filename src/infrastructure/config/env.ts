@@ -16,6 +16,15 @@ const envSchema = z.object({
   GOOGLE_SHEETS_SPREADSHEET_ID: z.string().optional(),
   GOOGLE_SHEETS_CREDENTIALS_PATH: z.string().optional(),
   GOOGLE_SHEETS_TAB_NAME: z.string().min(1).default("Campaigns"),
+  AGENT_SCHEDULER_ENABLED: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((value) => value === "true"),
+  AGENT_SCAN_INTERVAL_MINUTES: z.coerce.number().int().positive().default(5),
+  AGENT_RUN_ON_START: z
+    .enum(["true", "false"])
+    .default("true")
+    .transform((value) => value === "true"),
 });
 
 export type Env = z.infer<typeof envSchema>;

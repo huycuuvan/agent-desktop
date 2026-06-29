@@ -4,6 +4,7 @@
 **Phase 1 (Desktop Collector):** COMPLETED
 **Phase 2 (Snapshot Engine):** COMPLETED
 **Phase 3 (Google Sheets Sync Engine V1):** COMPLETED
+**Phase 4 (Scheduler + Auto Pipeline):** COMPLETED
 **Date:** 2026-06-30
 
 ## What Phase 1 does
@@ -259,10 +260,152 @@ tracked below.
   campaign still being seen" tracking accuracy for fewer Sheets API writes.
   A future phase could cheaply touch just those two columns on skip.
 
-## Next phase
+## What Phase 4 adds
 
-**Phase 4** — scheduling, Telegram notifications, and AI-driven analysis
-remain future phases, to be scoped individually. The per-account diff
-comparability fix (Known Limitation / Phase 3 Backlog, above the Phase 3
-section) and the Sheets removed-campaign marking (Known Limitation / Phase 4
-Backlog, above) are also tracked for upcoming phases.
+Phase 4 runs the full pipeline (Collector -> Snapshot -> Sheets Sync)
+automatically on an interval, reusing Phase 1–3 components as-is — no new
+collector, persistence, or Sheets logic was added. Telegram notifications and
+AI-driven analysis remain out of scope.
+
+New env vars:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `AGENT_SCHEDULER_ENABLED` | `false` | Master switch for the *recurring* loop. `false`: `pnpm agent:start` runs the pipeline once (if `AGENT_RUN_ON_START=true`) and exits — safe default, no background process. `true`: starts the recurring interval after the optional first run. |
+| `AGENT_SCAN_INTERVAL_MINUTES` | `5` | Minutes between scheduled pipeline runs (only relevant when `AGENT_SCHEDULER_ENABLED=true`) |
+| `AGENT_RUN_ON_START` | `true` | Whether to run the pipeline immediately on `agent:start`, before/without waiting for the first interval tick |
+
+**Design decision (flagging since the spec didn't fully disambiguate):**
+`AGENT_SCHEDULER_ENABLED` and `AGENT_RUN_ON_START` are independent. With the
+documented defaults (`false` / `true`), `pnpm agent:start` runs the pipeline
+exactly once and exits — which is also what makes `pnpm agent:start -- --dry-run`
+usable as a one-shot verification command rather than a long-running process.
+Setting `AGENT_SCHEDULER_ENABLED=true` is what turns it into a persistent
+scheduler (`Ctrl+C`/`SIGTERM` to stop).
+
+Pipeline order, per run: **run collector -> save snapshot -> sync latest
+snapshot to Sheets**. Failure handling:
+- Collector throws -> snapshot is *not* saved, Sheets sync is *not* called,
+  error logged, status `COLLECTOR_FAILED`.
+- Snapshot save throws -> Sheets sync is *not* called, error logged, status
+  `SNAPSHOT_FAILED` (not explicitly required by the spec, added defensively
+  alongside the two required failure modes).
+- Sheets sync throws -> the already-saved snapshot is **not** rolled back,
+  error logged, status `SHEETS_FAILED`.
+- All failure modes log and return a summary; the scheduler always continues
+  to the next scheduled run (failures never stop the loop).
+
+Modules:
+
+- **`AgentPipelineUseCase`** (`src/domain/usecases/AgentPipelineUseCase.ts`) —
+  pure orchestration use case (no direct I/O — only calls the three ports
+  below), implementing the failure-handling rules above and returning a
+  `PipelineRunSummary`.
+- **`CollectorRunner`** port (`src/domain/repositories/CollectorRunner.ts`) +
+  **`GoogleAdsCollectorRunner`** (`src/infrastructure/collector/GoogleAdsCollectorRunner.ts`)
+  — the exact Phase 1 collector wiring (AdsPower -> CDP -> tab detection ->
+  per-tab collection), extracted out of `pnpm dev`'s CLI so both `pnpm dev`
+  and `pnpm agent:start` call the same code path. `pnpm dev`'s behavior and
+  stdout output are unchanged by this extraction.
+- **`SheetsSyncer`** port (`src/domain/repositories/SheetsSyncer.ts`) +
+  **`SnapshotSheetsSyncer`** (`src/infrastructure/sheets/SnapshotSheetsSyncer.ts`)
+  — wraps the existing `SheetsClient`/`SheetsSyncExecutor`/`sheetRowMapper`
+  from Phase 3 unchanged; reads the latest snapshot itself and syncs it.
+- **`runGuard`** (`src/domain/services/runGuard.ts`) — pure overlap guard.
+  `createRunGuard(run)` wraps an async function so a second call while the
+  first is still in-flight returns `null` immediately instead of running
+  concurrently.
+- **`AgentScheduler`** (`src/infrastructure/scheduler/AgentScheduler.ts`) —
+  thin interval driver with an injectable timer (for testability):
+  `start()` runs once immediately if `runOnStart`, then registers a
+  `setInterval`; `stop()` clears it.
+
+CLI: `pnpm agent:start` / `pnpm agent:start -- --dry-run`
+(`src/presentation/cli/agentStart.ts`) wires
+`GoogleAdsCollectorRunner` + `PrismaSnapshotRepository` +
+`SnapshotSheetsSyncer` (skipped entirely, with a warning, if
+`GOOGLE_SHEETS_SPREADSHEET_ID`/`GOOGLE_SHEETS_CREDENTIALS_PATH` aren't set)
+into `AgentPipelineUseCase`, wraps it in `createRunGuard`, and drives it via
+`AgentScheduler`. Every run (scheduled or one-shot) logs a structured summary:
+`collectorRunId`, `accounts`, `campaigns`, `failedAccounts`,
+`sheetsAppendedRows`, `sheetsUpdatedRows`, `sheetsSkippedRows`, `durationMs`,
+`status`, `dryRun`, and `error` (if any). `--dry-run` still runs the collector
+and saves the snapshot (per the task's own recommendation), but passes
+`dryRun=true` down to `SnapshotSheetsSyncer.sync`, which makes zero Sheets
+API writes and only reports the planned append/update/skip counts.
+
+**Real end-to-end verification (2026-06-30):** `pnpm agent:start -- --dry-run`
+was run against the live AdsPower client and the real spreadsheet used in
+the Phase 3 verification. It connected to 2 real AdsPower profiles, detected
+2 Google Ads tabs, collected 5 campaigns, saved `collectorRunId: 7`, and
+logged `{ accounts: 2, campaigns: 5, failedAccounts: 0, sheetsAppendedRows: 0,
+sheetsUpdatedRows: 0, sheetsSkippedRows: 5, durationMs: 81795, status:
+"SUCCESS" }`. Reading the spreadsheet back directly afterward confirmed it
+still had only 6 rows with no `lastSeenRunId: 7` anywhere — i.e. the dry-run
+truly made zero writes despite running the real collector and saving a real
+snapshot.
+
+## Known Limitation / Phase 5 Backlog
+
+- **No retry/backoff for transient collector or Sheets failures within the
+  same scheduled run.** A `COLLECTOR_FAILED` or `SHEETS_FAILED` run simply
+  waits for the next scheduled tick (`AGENT_SCAN_INTERVAL_MINUTES` away);
+  there's no immediate retry with backoff for transient errors (e.g. a
+  single flaky AdsPower call). Acceptable for V1 since the scheduler already
+  self-heals on the next tick, but worth revisiting if intervals are long.
+- **`AgentScheduler` uses wall-clock `setInterval`, not a cron-like
+  schedule.** Drift accumulates only in the sense that each tick is
+  `intervalMs` after the previous tick fired (not after the previous run
+  *finished*) — if a run takes longer than the interval, the next tick still
+  fires on schedule but is skipped by `runGuard` (logged as a warning), so
+  runs never overlap but can be silently skipped under sustained slow runs.
+
+## Phase 4 closure
+
+Phase 4 is **CLOSED**. All real integration tests passed (see "Real
+end-to-end verification" above), and final verification was re-run clean
+before closing:
+
+- `pnpm test` — 84/84 passing
+- `pnpm build` — clean (`tsc -p tsconfig.json`)
+- `npx tsc -p tsconfig.json --noEmit` — clean (no type errors)
+
+No new features were added during closure — this pass was verification and
+documentation only (this file, `README.md`, `ARCHITECTURE.md`).
+
+**Recommended Git tag:** `v0.4.0` (Phases 1–4 complete: Collector, Snapshot
+Engine + Diff Engine, Google Sheets Sync V1, Scheduler + Auto Pipeline).
+
+## Phase 5 backlog (exact items)
+
+These are the only carried-over items going into Phase 5. Everything else in
+this document is historical context for *why* each exists.
+
+1. **Per-account diff comparability.** `getLatestComparableRun`
+   (`PrismaSnapshotRepository`) compares one run-level `fromDate`/`toDate`
+   (taken from the run's first `AccountSnapshot`) instead of matching
+   per-account. Fix: match by `customerId` + `providerCode` + `dateMode` +
+   `fromDate` + `toDate` at the `AccountSnapshot` level, not the
+   `CollectorRun` level. (Originally filed as Known Limitation / Phase 3
+   Backlog.)
+2. **Sheets sync never marks or removes campaigns that disappeared from the
+   latest run.** Cross-reference `CampaignDiffEngine`'s `REMOVED_CAMPAIGN`
+   change type to flag those sheet rows instead of leaving them silently
+   stale. (Originally filed as Known Limitation / Phase 4 Backlog.)
+3. **Sheets `SKIP` leaves `lastSeenRunId`/`lastSeenAt` stale.** When a row's
+   data columns are unchanged, those two tracking columns aren't touched.
+   Fix: cheaply update just those two columns on skip. (Originally filed as
+   Known Limitation / Phase 4 Backlog.)
+4. **No retry/backoff for transient collector or Sheets failures within a
+   scheduled run.** A `COLLECTOR_FAILED`/`SHEETS_FAILED` run waits for the
+   next scheduled tick rather than retrying immediately. (Originally filed
+   as Known Limitation / Phase 5 Backlog.)
+5. **`AgentScheduler` ticks on wall-clock `setInterval` from the previous
+   tick, not the previous run's finish time.** A run that takes longer than
+   `AGENT_SCAN_INTERVAL_MINUTES` causes the next tick to be skipped by
+   `runGuard` rather than rescheduled — correct (no overlap), but means slow
+   runs can silently reduce effective frequency. (Originally filed as Known
+   Limitation / Phase 5 Backlog.)
+
+Telegram notifications and AI-driven analysis remain unscoped future work,
+not yet broken into concrete backlog items.

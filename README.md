@@ -107,6 +107,65 @@ exits with a clear message if either is missing. Prints a JSON summary:
 See [PROJECT_STATUS.md](PROJECT_STATUS.md) for the sheet column layout and
 module breakdown (`SheetsClient`, `SheetsSyncPlanner`, `SheetsSyncExecutor`).
 
+## Scheduler / auto pipeline (Phase 4)
+
+```bash
+pnpm agent:start               # runs Collector -> Snapshot -> Sheets Sync once (or on an interval — see below)
+pnpm agent:start -- --dry-run  # same pipeline, but Sheets sync only prints the plan and writes nothing
+```
+
+`pnpm agent:start` wires together the existing collector, snapshot
+persistence, and Sheets sync into one pipeline and runs it under
+`AGENT_SCHEDULER_ENABLED`/`AGENT_RUN_ON_START`/`AGENT_SCAN_INTERVAL_MINUTES`:
+
+- With the defaults (`AGENT_SCHEDULER_ENABLED=false`, `AGENT_RUN_ON_START=true`),
+  it runs the pipeline **once and exits** — useful for manual runs and for
+  `--dry-run` verification.
+- Set `AGENT_SCHEDULER_ENABLED=true` to keep it running and re-run the
+  pipeline every `AGENT_SCAN_INTERVAL_MINUTES` minutes (`Ctrl+C`/`SIGTERM` to
+  stop). Overlapping runs are prevented — if a scheduled tick fires while the
+  previous run is still in progress, it's skipped with a warning, not run
+  concurrently.
+
+Every run logs a structured summary:
+
+```json
+{
+  "collectorRunId": 7,
+  "accounts": 2,
+  "campaigns": 5,
+  "failedAccounts": 0,
+  "sheetsAppendedRows": 0,
+  "sheetsUpdatedRows": 0,
+  "sheetsSkippedRows": 5,
+  "durationMs": 81795,
+  "status": "SUCCESS"
+}
+```
+
+Failure handling: if the collector throws, the snapshot is not saved and
+Sheets sync is not called (`status: "COLLECTOR_FAILED"`); if Sheets sync
+throws, the snapshot that was already saved is **not** rolled back
+(`status: "SHEETS_FAILED"`). Either way the error is logged and the next
+scheduled run proceeds normally. `--dry-run` still runs the collector and
+saves the snapshot, but Sheets sync makes zero API writes and only reports
+the planned append/update/skip counts. If `GOOGLE_SHEETS_SPREADSHEET_ID`/
+`GOOGLE_SHEETS_CREDENTIALS_PATH` aren't set, the agent logs a warning and
+runs collector + snapshot only, with all `sheets*Rows` reported as `0`.
+
+See [PROJECT_STATUS.md](PROJECT_STATUS.md) for the module breakdown
+(`AgentPipelineUseCase`, `CollectorRunner`/`GoogleAdsCollectorRunner`,
+`SheetsSyncer`/`SnapshotSheetsSyncer`, `runGuard`, `AgentScheduler`).
+
+## Project status
+
+Phases 1–4 (Desktop Collector, Snapshot + Diff Engine, Google Sheets Sync V1,
+Scheduler + Auto Pipeline) are complete and have passed real integration
+testing against live AdsPower profiles and a live Google Sheets spreadsheet.
+See [PROJECT_STATUS.md](PROJECT_STATUS.md) for the full per-phase writeup,
+known limitations, and the exact Phase 5 backlog. Recommended release tag for
+this state: **`v0.4.0`**.
+
 ## How to run tests
 
 ```bash
@@ -134,6 +193,9 @@ the full table with defaults. Summary:
 - `LOG_LEVEL` — Pino log level.
 - `GOOGLE_SHEETS_SPREADSHEET_ID` / `GOOGLE_SHEETS_CREDENTIALS_PATH` — required only for `pnpm sheets:sync`; spreadsheet to sync into and the path to a Google service account JSON key file.
 - `GOOGLE_SHEETS_TAB_NAME` — sheet tab name to sync into (default `Campaigns`).
+- `AGENT_SCHEDULER_ENABLED` — `false` (default) runs `pnpm agent:start` once and exits; `true` keeps it running on an interval.
+- `AGENT_SCAN_INTERVAL_MINUTES` — minutes between scheduled pipeline runs (default `5`).
+- `AGENT_RUN_ON_START` — whether `pnpm agent:start` runs the pipeline immediately (default `true`).
 
 ## Meaning of output fields
 

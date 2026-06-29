@@ -13,20 +13,34 @@ src/
       CampaignRow.ts
       GoogleAdsAccountReadResult.ts
       ProfileWithTabs.ts
+      CollectorRunSnapshot.ts      # CollectorRunInput / AccountSnapshotInput / CampaignSnapshotInput / CollectorRunSummary
+      CampaignDiff.ts              # CampaignChange / CampaignDiffSummary / FlatCampaignSnapshot / RunWithCampaigns
+      SheetSync.ts                 # SheetSyncCampaign / LatestRunForSheetsSync
+      PipelineRunSummary.ts        # PipelineStatus / PipelineRunSummary
     repositories/                  # Ports (interfaces) implemented by infrastructure
       AdsPowerProfileRepository.ts
       BrowserTabReader.ts
       GoogleAdsCampaignCollector.ts
+      SnapshotRepository.ts        # save/read CollectorRun + AccountSnapshot + CampaignSnapshot trees
+      CollectorRunner.ts            # collect(): GoogleAdsAccountReadResult[]
+      SheetsSyncer.ts               # sync(dryRun): SheetsSyncOutcome
     services/                      # Pure functions — fully unit-testable, no I/O
       googleAdsUrlParser.ts        # isGoogleAdsUrl, parseGoogleAdsUrl, parseAccountNameFromTitle
       googleAdsTabDetector.ts      # detectGoogleAdsTabs
       campaignRowParser.ts         # buildHeaderIndexMap, parseCampaignRow, mergeCampaignRows, parsePaginationText
       googleAdsDateRangeResolver.ts# resolveGoogleAdsDateMode, parseGoogleAdsDateRangeLabel
+      campaignKeyBuilder.ts        # buildCampaignKey (customerId|campaignName|account)
+      snapshotMapper.ts            # mapAccountResultToSnapshotInput, buildCollectorRunInput
+      CampaignDiffEngine.ts        # compareCampaignSnapshots
+      sheetRowMapper.ts            # SHEET_COLUMNS, buildSheetRowValues, buildSheetRows
+      SheetsSyncPlanner.ts         # decideRowAction (APPEND/UPDATE/SKIP), planSync
+      runGuard.ts                  # createRunGuard — prevents overlapping async runs
     usecases/                      # Orchestrate ports; still no I/O of their own
       ListOpenProfilesWithTabsUseCase.ts
       CollectGoogleAdsCampaignsUseCase.ts
+      AgentPipelineUseCase.ts       # collector -> snapshot -> sheets sync, with failure handling
 
-  infrastructure/                  # Concrete adapters — Playwright, HTTP, Prisma, Pino
+  infrastructure/                  # Concrete adapters — Playwright, HTTP, Prisma, Sheets API, Pino
     adspower/
       AdsPowerProfileRepositoryImpl.ts
       adsPowerApiSchema.ts
@@ -38,8 +52,17 @@ src/
       googleAdsTableReadiness.ts    # GoogleAdsTableReadinessWaiter
       CampaignTableReader.ts
       GoogleAdsCollector.ts         # orchestrates the above per tab
+    collector/
+      GoogleAdsCollectorRunner.ts   # CollectorRunner impl — wires AdsPower+CDP+collector, shared by `dev` and `agent:start`
     db/
       prismaClient.ts
+      PrismaSnapshotRepository.ts   # SnapshotRepository impl (SQLite via Prisma)
+    sheets/
+      SheetsClient.ts               # thin Google Sheets v4 API wrapper (service-account auth)
+      SheetsSyncExecutor.ts         # reads sheet, plans via SheetsSyncPlanner, applies writes (or not, if dryRun)
+      SnapshotSheetsSyncer.ts       # SheetsSyncer impl — reads latest snapshot, syncs it via SheetsSyncExecutor
+    scheduler/
+      AgentScheduler.ts             # interval driver (injectable timer): run-on-start + setInterval + stop
     logger/
       logger.ts
     config/
@@ -47,10 +70,16 @@ src/
 
   presentation/
     cli/
-      index.ts                     # wires everything, prints JSON to stdout
+      index.ts                     # `pnpm dev` — collector -> stdout JSON -> save snapshot
+      snapshotLatest.ts            # `pnpm snapshot:latest` — latest run summary
+      snapshotDiff.ts              # `pnpm snapshot:diff` — diff latest run vs. comparable previous run
+      sheetsSync.ts                # `pnpm sheets:sync` [-- --dry-run] — sync latest snapshot to Google Sheets
+      agentStart.ts                # `pnpm agent:start` [-- --dry-run] — scheduled collector -> snapshot -> sheets pipeline
 ```
 
 ## Data flow
+
+### Collector (`pnpm dev`, and the first stage of `pnpm agent:start`)
 
 ```
 AdsPower Local API  --(HTTP, profile list + CDP ws endpoint)-->
@@ -74,13 +103,78 @@ GoogleAdsCollector              -> per tab, in order:
        |                            CampaignTableReader          (read + scroll-merge rows)
        |                              -> campaignRowParser (pure parsing/merging)
        v
-GoogleAdsAccountReadResult[]     -> JSON.stringify -> stdout (CLI)
+GoogleAdsAccountReadResult[]
 ```
+
+`GoogleAdsCollectorRunner` (infrastructure/collector) wraps this whole chain
+behind the `CollectorRunner` port, so both `index.ts` (`pnpm dev`) and
+`agentStart.ts` (`pnpm agent:start`) call the exact same collection code —
+no duplicated browser-automation wiring.
 
 Each tab's full pipeline (refresh → date range → filter → read) runs inside a
 single CDP connection lifecycle owned by `GoogleAdsCollector`, opened and
 closed once per tab. Closing a `connectOverCDP` browser handle only
 disconnects Playwright — it does not close the user's actual browser tab.
+
+### Snapshot persistence (Phase 2)
+
+```
+GoogleAdsAccountReadResult[]  -> buildCollectorRunInput (snapshotMapper.ts)
+       -> CollectorRunInput { accounts: AccountSnapshotInput[] { campaigns: CampaignSnapshotInput[] } }
+       -> PrismaSnapshotRepository.saveRun
+       -> SQLite: CollectorRun -> AccountSnapshot -> CampaignSnapshot
+```
+
+`campaignKeyBuilder.buildCampaignKey` (`customerId|campaignName|account`) is
+the stable key used to match a campaign across runs, both in `snapshotMapper`
+(write path) and `CampaignDiffEngine`/`sheetRowMapper` (read paths).
+
+### Diff (Phase 2)
+
+```
+SnapshotRepository.getLatestRunWithCampaigns() + getLatestComparableRun()
+       -> two RunWithCampaigns (flattened FlatCampaignSnapshot[])
+       -> CampaignDiffEngine.compareCampaignSnapshots(previous, latest)
+       -> CampaignDiffResult { summary, changes: CampaignChange[] }
+```
+
+### Google Sheets sync (Phase 3)
+
+```
+SnapshotRepository.getLatestRunForSheetsSync() -> SheetSyncCampaign[]
+       -> sheetRowMapper.buildSheetRows -> SheetRowValues[] (ordered per SHEET_COLUMNS)
+       -> SheetsSyncExecutor.sync:
+            SheetsClient.readSheet            (current sheet state)
+            SheetsSyncPlanner.planSync        (pure: APPEND / UPDATE / SKIP per campaignKey)
+            SheetsClient.writeHeader/appendRows/updateRow   (skipped entirely if dryRun)
+```
+
+`SnapshotSheetsSyncer` (infrastructure/sheets) implements the `SheetsSyncer`
+port around this chain, so the scheduler doesn't need to know about
+`SheetsClient`/`SheetsSyncExecutor`/`sheetRowMapper` directly.
+
+### Scheduled pipeline (Phase 4)
+
+```
+AgentScheduler.start()  -- run-on-start? --> runGuard-wrapped run --> setInterval(run, intervalMs)
+       |
+       v
+createRunGuard(run)     -- skips a tick if the previous run is still in-flight, never runs concurrently
+       |
+       v
+AgentPipelineUseCase.run(dryRun):
+       1. CollectorRunner.collect()              -> on throw: status COLLECTOR_FAILED, stop here
+       2. SnapshotRepository.saveRun(...)        -> on throw: status SNAPSHOT_FAILED, stop here
+       3. SheetsSyncer.sync(dryRun)               -> on throw: status SHEETS_FAILED (snapshot already saved, not rolled back)
+       -> PipelineRunSummary { collectorRunId, accounts, campaigns, failedAccounts,
+                                sheetsAppendedRows/updatedRows/skippedRows, durationMs, status }
+```
+
+`agentStart.ts` wires `GoogleAdsCollectorRunner` + `PrismaSnapshotRepository`
++ `SnapshotSheetsSyncer` (or `null` if Sheets env vars are unset) into
+`AgentPipelineUseCase`, then drives it via `createRunGuard` +
+`AgentScheduler`. No new collector, persistence, or Sheets logic exists in
+Phase 4 — it only orchestrates Phase 1–3 components on a schedule.
 
 ## Main modules
 
@@ -96,20 +190,45 @@ disconnects Playwright — it does not close the user's actual browser tab.
 | **CampaignTableReader** | Reads column headers + visible campaign rows; scrolls Google Ads' virtualized list (`scrollIntoViewIfNeeded`, never a click) and merges newly-revealed rows by a stable key until the full filtered count is collected, no new rows appear, or it times out |
 | **CampaignRowParser** (`campaignRowParser.ts`) | Pure functions: maps header text to column index, extracts/cleans each `CampaignRow` field, builds the stable merge key, parses pagination text |
 | **GoogleAdsCollector** | Orchestrates one tab's full pipeline (the modules above, in order) and assembles the final `GoogleAdsAccountReadResult` |
+| **GoogleAdsCollectorRunner** | `CollectorRunner` port impl; wraps AdsPower listing + per-tab collection across all profiles, shared by `pnpm dev` and `pnpm agent:start` |
+| **PrismaSnapshotRepository** | `SnapshotRepository` port impl; persists/reads `CollectorRun`/`AccountSnapshot`/`CampaignSnapshot` via Prisma/SQLite |
+| **CampaignDiffEngine** | Pure: compares two flattened campaign snapshots by `campaignKey`, returns categorized changes |
+| **SheetsClient** | Thin Google Sheets v4 API wrapper (service-account `GoogleAuth`): read/write-header/append/update, no business logic |
+| **SheetsSyncPlanner** | Pure: decides APPEND/UPDATE/SKIP per `campaignKey`, ignoring the `lastSeenRunId`/`lastSeenAt` tracking columns |
+| **SheetsSyncExecutor** | Orchestrates `SheetsClient` + `SheetsSyncPlanner`; no-op writes when `dryRun` |
+| **SnapshotSheetsSyncer** | `SheetsSyncer` port impl; reads the latest snapshot itself and syncs it via `SheetsSyncExecutor` |
+| **runGuard** | Pure: wraps an async function so overlapping invocations are skipped, never run concurrently |
+| **AgentScheduler** | Drives a run function on an interval (injectable timer for tests); optional run-on-start |
+| **AgentPipelineUseCase** | Orchestrates `CollectorRunner` -> `SnapshotRepository` -> `SheetsSyncer` with the failure-handling rules described above |
 
 ## Rules
 
-These are load-bearing constraints for Phase 1 and should hold for any future
-phase that touches the browser-automation layer:
+These are load-bearing constraints for the browser-automation layer
+(established in Phase 1, still in force):
 
 - **No `page.reload()`.** Refresh always goes through Google Ads' own UI
   Refresh control (`RefreshExecutor`), never a hard page reload.
 - **No campaign row clicks.** Rows are only scrolled into view
   (`scrollIntoViewIfNeeded`) and read; nothing inside a row is ever clicked.
-- **No edits.** The only write-type interactions anywhere in the pipeline are:
-  clicking Refresh, selecting a date-range preset/typing a day count, and
-  typing into the campaign-name filter box. No campaign, ad group, ad, or
-  account setting is ever changed.
-- **Read-only collector.** Phase 1's job ends at producing JSON in memory /
-  stdout. It does not write to SQLite (beyond a minimal traceability log row),
-  Google Sheets, or any external system — that begins in Phase 2.
+- **No edits.** The only write-type interactions anywhere in the collector
+  pipeline are: clicking Refresh, selecting a date-range preset/typing a day
+  count, and typing into the campaign-name filter box. No campaign, ad group,
+  ad, or account setting is ever changed.
+- **Read-only collector.** The collector's job ends at producing
+  `GoogleAdsAccountReadResult[]` in memory. It never writes to Google Ads,
+  Google Sheets, or any external system itself — persistence (SQLite) and
+  Sheets sync are separate stages downstream, never inside the
+  browser-automation layer.
+
+Constraints added by later phases:
+
+- **Sheets sync is upsert-only (Phase 3 V1).** `SheetsSyncPlanner`/
+  `SheetsSyncExecutor` only append or update rows by `campaignKey`; they
+  never delete a row or mark a campaign as removed.
+- **The scheduler never runs the pipeline concurrently with itself.**
+  `AgentPipelineUseCase` runs are always wrapped in `createRunGuard`; a
+  scheduled tick that fires while a run is still in-flight is skipped (with
+  a warning), never executed in parallel.
+- **A pipeline failure never stops the schedule.** `COLLECTOR_FAILED`,
+  `SNAPSHOT_FAILED`, and `SHEETS_FAILED` are all logged and returned as a
+  summary; `AgentScheduler` always proceeds to the next scheduled tick.
