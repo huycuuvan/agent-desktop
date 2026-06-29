@@ -5,10 +5,13 @@ import { PrismaSnapshotRepository } from "../../infrastructure/db/PrismaSnapshot
 import { GoogleAdsCollectorRunner } from "../../infrastructure/collector/GoogleAdsCollectorRunner.js";
 import { SheetsClient } from "../../infrastructure/sheets/SheetsClient.js";
 import { SnapshotSheetsSyncer } from "../../infrastructure/sheets/SnapshotSheetsSyncer.js";
+import { TelegramClient } from "../../infrastructure/telegram/TelegramClient.js";
+import { TelegramNotifier } from "../../infrastructure/telegram/TelegramNotifier.js";
 import { AgentScheduler } from "../../infrastructure/scheduler/AgentScheduler.js";
 import { AgentPipelineUseCase } from "../../domain/usecases/AgentPipelineUseCase.js";
 import { createRunGuard } from "../../domain/services/runGuard.js";
 import type { SheetsSyncer } from "../../domain/repositories/SheetsSyncer.js";
+import type { Notifier } from "../../domain/repositories/Notifier.js";
 import type { PipelineRunSummary } from "../../domain/entities/PipelineRunSummary.js";
 
 async function main(): Promise<void> {
@@ -32,10 +35,23 @@ async function main(): Promise<void> {
     );
   }
 
+  let notifier: Notifier | null = null;
+  if (env.TELEGRAM_NOTIFICATIONS_ENABLED) {
+    if (env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID) {
+      const telegramClient = new TelegramClient(env.TELEGRAM_BOT_TOKEN);
+      notifier = new TelegramNotifier(snapshotRepository, telegramClient, env.TELEGRAM_CHAT_ID);
+    } else {
+      logger.warn(
+        "TELEGRAM_NOTIFICATIONS_ENABLED=true but TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID are not set — skipping Telegram notifications.",
+      );
+    }
+  }
+
   const pipeline = new AgentPipelineUseCase(
     collectorRunner,
     snapshotRepository,
     sheetsSyncer,
+    notifier,
     env.WATCH_PROVIDER_CODE,
     env.GOOGLE_ADS_DATE_MODE,
   );
@@ -56,6 +72,7 @@ async function main(): Promise<void> {
       schedulerEnabled: env.AGENT_SCHEDULER_ENABLED,
       intervalMinutes: env.AGENT_SCAN_INTERVAL_MINUTES,
       runOnStart: env.AGENT_RUN_ON_START,
+      telegramNotificationsEnabled: env.TELEGRAM_NOTIFICATIONS_ENABLED,
       dryRun,
     },
     "Starting desktop-agent",
@@ -100,13 +117,20 @@ function logPipelineSummary(summary: PipelineRunSummary, dryRun: boolean): void 
       sheetsAppendedRows: summary.sheetsAppendedRows,
       sheetsUpdatedRows: summary.sheetsUpdatedRows,
       sheetsSkippedRows: summary.sheetsSkippedRows,
+      notificationStatus: summary.notificationStatus,
       durationMs: summary.durationMs,
       status: summary.status,
       dryRun,
       ...(summary.error ? { error: summary.error } : {}),
+      ...(summary.notificationError ? { notificationError: summary.notificationError } : {}),
     },
     "Pipeline run summary",
   );
+
+  if (dryRun && summary.notificationStatus === "DRY_RUN" && summary.notificationMessage) {
+    console.log("\nPlanned Telegram message (dry-run, not sent):\n");
+    console.log(summary.notificationMessage);
+  }
 }
 
 main().catch((error) => {

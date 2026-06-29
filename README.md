@@ -157,14 +157,72 @@ See [PROJECT_STATUS.md](PROJECT_STATUS.md) for the module breakdown
 (`AgentPipelineUseCase`, `CollectorRunner`/`GoogleAdsCollectorRunner`,
 `SheetsSyncer`/`SnapshotSheetsSyncer`, `runGuard`, `AgentScheduler`).
 
+## Telegram notifications (Phase 5)
+
+```bash
+pnpm telegram:test            # sends "Desktop Agent Telegram test OK" to TELEGRAM_CHAT_ID
+pnpm telegram:notify-latest   # sends a real alert if the latest run's diff has changes, prints a summary either way
+```
+
+After each pipeline run, if `TELEGRAM_NOTIFICATIONS_ENABLED=true` (and
+`TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` are set), `pnpm agent:start` loads
+the latest run's diff against its comparable previous run (the same Diff
+Engine `pnpm snapshot:diff` uses) and sends one Telegram message
+summarizing `NEW_CAMPAIGN`/`REMOVED_CAMPAIGN`/`STATUS_CHANGED`/
+`BUDGET_CHANGED`/`COST_CHANGED`/`METRIC_CHANGED` changes — only if there are
+any. No message is sent when there's nothing to report. The message lists
+up to 10 detail items, with `"...and N more changes"` appended if there are
+more:
+
+```
+🚨 Google Ads Update - QKA
+
+Run: #12
+Accounts: 2
+Campaigns: 5
+
+Changes:
+- Status changed: 1
+- Budget changed: 0
+- Cost changed: 1
+- Metric changed: 1
+- New campaigns: 0
+- Removed campaigns: 0
+
+Details:
+1. STATUS_CHANGED
+Campaign: NQT-MOMO-QKA-PG3-2906 #2
+Account: 727-700-2311
+Before: Paused
+After: Eligible
+
+2. COST_CHANGED
+Campaign: GG-ALEX-QKA-NGN-3006 HOTZ 1.1
+Customer: 8357912352
+Before: IDR0
+After: IDR42,627
+```
+
+In `pnpm agent:start -- --dry-run`, the planned message is printed (under
+"Planned Telegram message (dry-run, not sent)") instead of being sent. A
+Telegram failure never crashes the pipeline or rolls back the snapshot/Sheets
+sync that already happened — it's logged and the run's `status` becomes
+`SUCCESS_WITH_NOTIFICATION_ERROR` (or stays whatever failure status it
+already had, e.g. `SHEETS_FAILED`, if something else also failed in the same
+run).
+
+See [PROJECT_STATUS.md](PROJECT_STATUS.md) for the module breakdown
+(`TelegramMessageFormatter`, `TelegramClient`, `TelegramNotifier`).
+
 ## Project status
 
-Phases 1–4 (Desktop Collector, Snapshot + Diff Engine, Google Sheets Sync V1,
-Scheduler + Auto Pipeline) are complete and have passed real integration
-testing against live AdsPower profiles and a live Google Sheets spreadsheet.
-See [PROJECT_STATUS.md](PROJECT_STATUS.md) for the full per-phase writeup,
-known limitations, and the exact Phase 5 backlog. Recommended release tag for
-this state: **`v0.4.0`**.
+Phases 1–5 (Desktop Collector, Snapshot + Diff Engine, Google Sheets Sync V1,
+Scheduler + Auto Pipeline, Telegram Notification Engine V1) are complete and
+have passed real integration testing against live AdsPower profiles, a live
+Google Sheets spreadsheet, and a live Telegram bot/chat. See
+[PROJECT_STATUS.md](PROJECT_STATUS.md) for the full per-phase writeup, known
+limitations, and the exact Phase 6 backlog. Recommended release tag for this
+state: **`v0.5.0`**.
 
 ## How to run tests
 
@@ -196,6 +254,8 @@ the full table with defaults. Summary:
 - `AGENT_SCHEDULER_ENABLED` — `false` (default) runs `pnpm agent:start` once and exits; `true` keeps it running on an interval.
 - `AGENT_SCAN_INTERVAL_MINUTES` — minutes between scheduled pipeline runs (default `5`).
 - `AGENT_RUN_ON_START` — whether `pnpm agent:start` runs the pipeline immediately (default `true`).
+- `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` — required only for `pnpm telegram:test`/`pnpm telegram:notify-latest` and for Telegram alerts from `pnpm agent:start`.
+- `TELEGRAM_NOTIFICATIONS_ENABLED` — `false` (default) skips Telegram entirely from `pnpm agent:start`; `true` sends an alert after each run if the diff has changes.
 
 ## Meaning of output fields
 

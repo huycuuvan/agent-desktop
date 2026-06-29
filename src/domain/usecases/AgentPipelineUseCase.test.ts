@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { AgentPipelineUseCase } from "./AgentPipelineUseCase.js";
 import type { CollectorRunner } from "../repositories/CollectorRunner.js";
 import type { SheetsSyncer, SheetsSyncOutcome } from "../repositories/SheetsSyncer.js";
+import type { Notifier, NotificationResult } from "../repositories/Notifier.js";
 import type { SnapshotRepository } from "../repositories/SnapshotRepository.js";
 import type { CollectorRunInput } from "../entities/CollectorRunSnapshot.js";
 import type { GoogleAdsAccountReadResult } from "../entities/GoogleAdsAccountReadResult.js";
@@ -90,6 +91,19 @@ class FakeSheetsSyncer implements SheetsSyncer {
   }
 }
 
+class FakeNotifier implements Notifier {
+  public callCount = 0;
+  public receivedDryRun: boolean[] = [];
+
+  constructor(private readonly behavior: () => Promise<NotificationResult>) {}
+
+  async notifyLatestDiff(dryRun: boolean): Promise<NotificationResult> {
+    this.callCount += 1;
+    this.receivedDryRun.push(dryRun);
+    return this.behavior();
+  }
+}
+
 describe("AgentPipelineUseCase", () => {
   it("runs collector -> snapshot -> sheets sync and reports a SUCCESS summary", async () => {
     const collector = new FakeCollectorRunner(async () => [
@@ -99,7 +113,7 @@ describe("AgentPipelineUseCase", () => {
     const snapshotRepository = new FakeSnapshotRepository();
     const sheetsSyncer = new FakeSheetsSyncer(async () => ({ appendedRows: 1, updatedRows: 2, skippedRows: 3 }));
 
-    const pipeline = new AgentPipelineUseCase(collector, snapshotRepository, sheetsSyncer, "QKA", "AUTO");
+    const pipeline = new AgentPipelineUseCase(collector, snapshotRepository, sheetsSyncer, null, "QKA", "AUTO");
     const summary = await pipeline.run(false);
 
     assert.equal(summary.status, "SUCCESS");
@@ -110,6 +124,7 @@ describe("AgentPipelineUseCase", () => {
     assert.equal(summary.sheetsAppendedRows, 1);
     assert.equal(summary.sheetsUpdatedRows, 2);
     assert.equal(summary.sheetsSkippedRows, 3);
+    assert.equal(summary.notificationStatus, null);
     assert.ok(summary.durationMs >= 0);
     assert.equal(summary.error, undefined);
     assert.equal(snapshotRepository.savedRuns.length, 1);
@@ -123,7 +138,7 @@ describe("AgentPipelineUseCase", () => {
     const snapshotRepository = new FakeSnapshotRepository();
     const sheetsSyncer = new FakeSheetsSyncer(async () => ({ appendedRows: 0, updatedRows: 0, skippedRows: 0 }));
 
-    const pipeline = new AgentPipelineUseCase(collector, snapshotRepository, sheetsSyncer, "QKA", "AUTO");
+    const pipeline = new AgentPipelineUseCase(collector, snapshotRepository, sheetsSyncer, null, "QKA", "AUTO");
     const summary = await pipeline.run(false);
 
     assert.equal(summary.status, "COLLECTOR_FAILED");
@@ -142,7 +157,7 @@ describe("AgentPipelineUseCase", () => {
       throw new Error("Sheets API rate limited");
     });
 
-    const pipeline = new AgentPipelineUseCase(collector, snapshotRepository, sheetsSyncer, "QKA", "AUTO");
+    const pipeline = new AgentPipelineUseCase(collector, snapshotRepository, sheetsSyncer, null, "QKA", "AUTO");
     const summary = await pipeline.run(false);
 
     assert.equal(summary.status, "SHEETS_FAILED");
@@ -158,7 +173,7 @@ describe("AgentPipelineUseCase", () => {
     const collector = new FakeCollectorRunner(async () => [makeResult()]);
     const snapshotRepository = new FakeSnapshotRepository();
 
-    const pipeline = new AgentPipelineUseCase(collector, snapshotRepository, null, "QKA", "AUTO");
+    const pipeline = new AgentPipelineUseCase(collector, snapshotRepository, null, null, "QKA", "AUTO");
     const summary = await pipeline.run(false);
 
     assert.equal(summary.status, "SUCCESS");
@@ -173,9 +188,84 @@ describe("AgentPipelineUseCase", () => {
     const snapshotRepository = new FakeSnapshotRepository();
     const sheetsSyncer = new FakeSheetsSyncer(async () => ({ appendedRows: 5, updatedRows: 0, skippedRows: 0 }));
 
-    const pipeline = new AgentPipelineUseCase(collector, snapshotRepository, sheetsSyncer, "QKA", "AUTO");
+    const pipeline = new AgentPipelineUseCase(collector, snapshotRepository, sheetsSyncer, null, "QKA", "AUTO");
     await pipeline.run(true);
 
     assert.deepEqual(sheetsSyncer.receivedDryRun, [true]);
+  });
+
+  it("sends a notification when the diff has changes and reports SENT in the summary", async () => {
+    const collector = new FakeCollectorRunner(async () => [makeResult()]);
+    const snapshotRepository = new FakeSnapshotRepository();
+    const notifier = new FakeNotifier(async () => ({ status: "SENT", message: "some message", changeCount: 2 }));
+
+    const pipeline = new AgentPipelineUseCase(collector, snapshotRepository, null, notifier, "QKA", "AUTO");
+    const summary = await pipeline.run(false);
+
+    assert.equal(summary.status, "SUCCESS");
+    assert.equal(summary.notificationStatus, "SENT");
+    assert.equal(summary.notificationMessage, "some message");
+    assert.equal(summary.notificationError, undefined);
+    assert.deepEqual(notifier.receivedDryRun, [false]);
+  });
+
+  it("reports NO_CHANGES without affecting pipeline status when there is nothing to notify", async () => {
+    const collector = new FakeCollectorRunner(async () => [makeResult()]);
+    const snapshotRepository = new FakeSnapshotRepository();
+    const notifier = new FakeNotifier(async () => ({ status: "NO_CHANGES", message: null, changeCount: 0 }));
+
+    const pipeline = new AgentPipelineUseCase(collector, snapshotRepository, null, notifier, "QKA", "AUTO");
+    const summary = await pipeline.run(false);
+
+    assert.equal(summary.status, "SUCCESS");
+    assert.equal(summary.notificationStatus, "NO_CHANGES");
+    assert.equal(summary.notificationMessage, null);
+  });
+
+  it("does not fail the pipeline when the notifier throws — status becomes SUCCESS_WITH_NOTIFICATION_ERROR", async () => {
+    const collector = new FakeCollectorRunner(async () => [makeResult()]);
+    const snapshotRepository = new FakeSnapshotRepository();
+    const notifier = new FakeNotifier(async () => {
+      throw new Error("Telegram API down");
+    });
+
+    const pipeline = new AgentPipelineUseCase(collector, snapshotRepository, null, notifier, "QKA", "AUTO");
+    const summary = await pipeline.run(false);
+
+    assert.equal(summary.status, "SUCCESS_WITH_NOTIFICATION_ERROR");
+    assert.equal(summary.collectorRunId, 1);
+    assert.equal(summary.notificationError, "Telegram API down");
+    assert.equal(snapshotRepository.savedRuns.length, 1);
+  });
+
+  it("keeps SHEETS_FAILED status (does not overwrite with notification status) when both sheets and notifier fail", async () => {
+    const collector = new FakeCollectorRunner(async () => [makeResult()]);
+    const snapshotRepository = new FakeSnapshotRepository();
+    const sheetsSyncer = new FakeSheetsSyncer(async () => {
+      throw new Error("Sheets API rate limited");
+    });
+    const notifier = new FakeNotifier(async () => {
+      throw new Error("Telegram API down");
+    });
+
+    const pipeline = new AgentPipelineUseCase(collector, snapshotRepository, sheetsSyncer, notifier, "QKA", "AUTO");
+    const summary = await pipeline.run(false);
+
+    assert.equal(summary.status, "SHEETS_FAILED");
+    assert.equal(summary.error, "Sheets API rate limited");
+    assert.equal(summary.notificationError, "Telegram API down");
+  });
+
+  it("passes dryRun through to the notifier", async () => {
+    const collector = new FakeCollectorRunner(async () => [makeResult()]);
+    const snapshotRepository = new FakeSnapshotRepository();
+    const notifier = new FakeNotifier(async () => ({ status: "DRY_RUN", message: "planned message", changeCount: 1 }));
+
+    const pipeline = new AgentPipelineUseCase(collector, snapshotRepository, null, notifier, "QKA", "AUTO");
+    const summary = await pipeline.run(true);
+
+    assert.deepEqual(notifier.receivedDryRun, [true]);
+    assert.equal(summary.notificationStatus, "DRY_RUN");
+    assert.equal(summary.notificationMessage, "planned message");
   });
 });

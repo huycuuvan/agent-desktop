@@ -24,6 +24,7 @@ src/
       SnapshotRepository.ts        # save/read CollectorRun + AccountSnapshot + CampaignSnapshot trees
       CollectorRunner.ts            # collect(): GoogleAdsAccountReadResult[]
       SheetsSyncer.ts               # sync(dryRun): SheetsSyncOutcome
+      Notifier.ts                   # notifyLatestDiff(dryRun): NotificationResult
     services/                      # Pure functions — fully unit-testable, no I/O
       googleAdsUrlParser.ts        # isGoogleAdsUrl, parseGoogleAdsUrl, parseAccountNameFromTitle
       googleAdsTabDetector.ts      # detectGoogleAdsTabs
@@ -35,12 +36,13 @@ src/
       sheetRowMapper.ts            # SHEET_COLUMNS, buildSheetRowValues, buildSheetRows
       SheetsSyncPlanner.ts         # decideRowAction (APPEND/UPDATE/SKIP), planSync
       runGuard.ts                  # createRunGuard — prevents overlapping async runs
+      TelegramMessageFormatter.ts  # formatTelegramMessage — builds the alert text, or null if no changes
     usecases/                      # Orchestrate ports; still no I/O of their own
       ListOpenProfilesWithTabsUseCase.ts
       CollectGoogleAdsCampaignsUseCase.ts
-      AgentPipelineUseCase.ts       # collector -> snapshot -> sheets sync, with failure handling
+      AgentPipelineUseCase.ts       # collector -> snapshot -> sheets sync -> notify, with failure handling
 
-  infrastructure/                  # Concrete adapters — Playwright, HTTP, Prisma, Sheets API, Pino
+  infrastructure/                  # Concrete adapters — Playwright, HTTP, Prisma, Sheets API, Telegram API, Pino
     adspower/
       AdsPowerProfileRepositoryImpl.ts
       adsPowerApiSchema.ts
@@ -61,6 +63,9 @@ src/
       SheetsClient.ts               # thin Google Sheets v4 API wrapper (service-account auth)
       SheetsSyncExecutor.ts         # reads sheet, plans via SheetsSyncPlanner, applies writes (or not, if dryRun)
       SnapshotSheetsSyncer.ts       # SheetsSyncer impl — reads latest snapshot, syncs it via SheetsSyncExecutor
+    telegram/
+      TelegramClient.ts             # thin Telegram Bot API wrapper (sendMessage via global fetch)
+      TelegramNotifier.ts           # Notifier impl — loads latest diff, formats, sends (or plans, if dryRun)
     scheduler/
       AgentScheduler.ts             # interval driver (injectable timer): run-on-start + setInterval + stop
     logger/
@@ -74,7 +79,9 @@ src/
       snapshotLatest.ts            # `pnpm snapshot:latest` — latest run summary
       snapshotDiff.ts              # `pnpm snapshot:diff` — diff latest run vs. comparable previous run
       sheetsSync.ts                # `pnpm sheets:sync` [-- --dry-run] — sync latest snapshot to Google Sheets
-      agentStart.ts                # `pnpm agent:start` [-- --dry-run] — scheduled collector -> snapshot -> sheets pipeline
+      telegramTest.ts              # `pnpm telegram:test` — sends a literal test message
+      telegramNotifyLatest.ts      # `pnpm telegram:notify-latest` — sends a real alert for the latest diff, if any
+      agentStart.ts                # `pnpm agent:start` [-- --dry-run] — scheduled collector -> snapshot -> sheets -> notify pipeline
 ```
 
 ## Data flow
@@ -153,7 +160,23 @@ SnapshotRepository.getLatestRunForSheetsSync() -> SheetSyncCampaign[]
 port around this chain, so the scheduler doesn't need to know about
 `SheetsClient`/`SheetsSyncExecutor`/`sheetRowMapper` directly.
 
-### Scheduled pipeline (Phase 4)
+### Telegram notification (Phase 5)
+
+```
+SnapshotRepository.getLatestRunSummary()                  -> { runId, accountsCount, campaignsCount }
+SnapshotRepository.getLatestRunWithCampaigns()
+  + getLatestComparableRun()                              -> two RunWithCampaigns (same Phase 2 Diff Engine methods)
+       -> CampaignDiffEngine.compareCampaignSnapshots      -> { summary, changes }
+       -> TelegramMessageFormatter.formatTelegramMessage   -> string | null (null = no changes, don't send)
+       -> TelegramClient.sendMessage                       (skipped entirely if dryRun)
+```
+
+`TelegramNotifier` (infrastructure/telegram) implements the `Notifier` port
+around this chain. It adds no new repository methods or schema — it reuses
+the exact `SnapshotRepository` methods the Phase 2 Diff Engine already
+exposes.
+
+### Scheduled pipeline (Phase 4, extended in Phase 5)
 
 ```
 AgentScheduler.start()  -- run-on-start? --> runGuard-wrapped run --> setInterval(run, intervalMs)
@@ -166,15 +189,21 @@ AgentPipelineUseCase.run(dryRun):
        1. CollectorRunner.collect()              -> on throw: status COLLECTOR_FAILED, stop here
        2. SnapshotRepository.saveRun(...)        -> on throw: status SNAPSHOT_FAILED, stop here
        3. SheetsSyncer.sync(dryRun)               -> on throw: status SHEETS_FAILED (snapshot already saved, not rolled back)
+       4. Notifier.notifyLatestDiff(dryRun)       -> on throw: notificationError set; status becomes
+                                                      SUCCESS_WITH_NOTIFICATION_ERROR only if it was SUCCESS
+                                                      (a prior SHEETS_FAILED is preserved, not overwritten)
        -> PipelineRunSummary { collectorRunId, accounts, campaigns, failedAccounts,
-                                sheetsAppendedRows/updatedRows/skippedRows, durationMs, status }
+                                sheetsAppendedRows/updatedRows/skippedRows,
+                                notificationStatus, notificationMessage, durationMs, status }
 ```
 
 `agentStart.ts` wires `GoogleAdsCollectorRunner` + `PrismaSnapshotRepository`
-+ `SnapshotSheetsSyncer` (or `null` if Sheets env vars are unset) into
-`AgentPipelineUseCase`, then drives it via `createRunGuard` +
-`AgentScheduler`. No new collector, persistence, or Sheets logic exists in
-Phase 4 — it only orchestrates Phase 1–3 components on a schedule.
++ `SnapshotSheetsSyncer` (or `null` if Sheets env vars are unset) +
+`TelegramNotifier` (or `null` if `TELEGRAM_NOTIFICATIONS_ENABLED` is `false`
+or its env vars are unset) into `AgentPipelineUseCase`, then drives it via
+`createRunGuard` + `AgentScheduler`. No new collector, persistence, Sheets,
+or diff logic exists in Phase 5 — it only adds notification on top of
+Phase 1–4 components.
 
 ## Main modules
 
@@ -199,7 +228,10 @@ Phase 4 — it only orchestrates Phase 1–3 components on a schedule.
 | **SnapshotSheetsSyncer** | `SheetsSyncer` port impl; reads the latest snapshot itself and syncs it via `SheetsSyncExecutor` |
 | **runGuard** | Pure: wraps an async function so overlapping invocations are skipped, never run concurrently |
 | **AgentScheduler** | Drives a run function on an interval (injectable timer for tests); optional run-on-start |
-| **AgentPipelineUseCase** | Orchestrates `CollectorRunner` -> `SnapshotRepository` -> `SheetsSyncer` with the failure-handling rules described above |
+| **TelegramMessageFormatter** | Pure: builds the alert text from a diff summary/changes, or returns `null` when there are no changes |
+| **TelegramClient** | Thin Telegram Bot API wrapper (`sendMessage` via global `fetch`); no business logic |
+| **TelegramNotifier** | `Notifier` port impl; loads the latest diff via existing `SnapshotRepository`/`CampaignDiffEngine` and sends (or plans, if `dryRun`) the formatted message |
+| **AgentPipelineUseCase** | Orchestrates `CollectorRunner` -> `SnapshotRepository` -> `SheetsSyncer` -> `Notifier` with the failure-handling rules described above |
 
 ## Rules
 
@@ -232,3 +264,11 @@ Constraints added by later phases:
 - **A pipeline failure never stops the schedule.** `COLLECTOR_FAILED`,
   `SNAPSHOT_FAILED`, and `SHEETS_FAILED` are all logged and returned as a
   summary; `AgentScheduler` always proceeds to the next scheduled tick.
+- **A Telegram failure never crashes the pipeline or rolls back work
+  already done (Phase 5).** `TelegramNotifier` errors are caught by
+  `AgentPipelineUseCase` and recorded as `notificationError`; the snapshot
+  and any completed Sheets sync are unaffected.
+- **No message is ever sent when there are no changes (Phase 5).**
+  `TelegramMessageFormatter.formatTelegramMessage` returns `null` for an
+  empty change set, and both `TelegramNotifier` and the CLIs treat `null` as
+  "do not call `TelegramClient.sendMessage`".

@@ -5,6 +5,7 @@
 **Phase 2 (Snapshot Engine):** COMPLETED
 **Phase 3 (Google Sheets Sync Engine V1):** COMPLETED
 **Phase 4 (Scheduler + Auto Pipeline):** COMPLETED
+**Phase 5 (Telegram Notification Engine V1):** COMPLETED
 **Date:** 2026-06-30
 
 ## What Phase 1 does
@@ -360,6 +361,114 @@ snapshot.
   fires on schedule but is skipped by `runGuard` (logged as a warning), so
   runs never overlap but can be silently skipped under sustained slow runs.
 
+## What Phase 5 adds
+
+Phase 5 sends a Telegram alert after each scheduled pipeline run when the
+Snapshot Diff Engine detects meaningful changes since the last comparable
+run. It reuses the existing Scheduler, Snapshot, Diff, and Sheets Sync
+components unchanged — no Gmail watcher, no auto-accept, no auto pause/edit
+of campaigns, and no local AI.
+
+New env vars:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `TELEGRAM_BOT_TOKEN` | _(none)_ | Bot token from `@BotFather`; required to send any Telegram message |
+| `TELEGRAM_CHAT_ID` | _(none)_ | Target chat/user id to send alerts to |
+| `TELEGRAM_NOTIFICATIONS_ENABLED` | `false` | Master switch — `pnpm agent:start` only attempts Telegram notifications when this is `true` (mirrors the `AGENT_SCHEDULER_ENABLED` pattern from Phase 4) |
+
+Modules:
+
+- **`TelegramMessageFormatter`** (`src/domain/services/TelegramMessageFormatter.ts`)
+  — pure domain function. `formatTelegramMessage(input)` builds the alert
+  text (header, change-type counts, up to 10 detail items, then
+  `"...and N more changes"` if there are more), or returns `null` when
+  `changes` is empty — callers must not send a message in that case. Detail
+  lines show `Account: X` when the campaign has an account, falling back to
+  `Customer: X` (the `customerId`) when it doesn't; `Before`/`After` lines
+  are omitted entirely for `NEW_CAMPAIGN`/`REMOVED_CAMPAIGN` (both `null`).
+- **`TelegramClient`** (`src/infrastructure/telegram/TelegramClient.ts`) —
+  thin wrapper around the Telegram Bot API (`POST
+  https://api.telegram.org/bot<token>/sendMessage`) using the global `fetch`.
+  No business logic; throws on a non-OK response.
+- **`TelegramNotifier`** (`src/infrastructure/telegram/TelegramNotifier.ts`)
+  — implements the `Notifier` port (`src/domain/repositories/Notifier.ts`).
+  `notifyLatestDiff(dryRun)` loads the latest run summary
+  (`SnapshotRepository.getLatestRunSummary`) and the latest/previous
+  comparable runs (`getLatestRunWithCampaigns`/`getLatestComparableRun` —
+  the exact same Phase 2 Diff Engine repository methods `pnpm snapshot:diff`
+  uses), runs `CampaignDiffEngine.compareCampaignSnapshots`, formats the
+  message, and either sends it via `TelegramClient` (real run) or skips the
+  send and reports the planned message (`dryRun`). No new repository
+  methods or schema changes were needed — Phase 5 only reads what Phase 2
+  already exposes.
+
+Pipeline integration: `AgentPipelineUseCase` now takes an optional 4th
+constructor argument, `notifier: Notifier | null`, called once after the
+existing collector -> snapshot -> Sheets-sync steps:
+
+- If `notifier` is `null` (Telegram disabled or not configured),
+  notification is skipped entirely — same `null`-port pattern as
+  `sheetsSyncer`.
+- If the notifier throws, the error is caught and recorded in
+  `notificationError`; the pipeline does **not** crash or fail. If the
+  pipeline was otherwise `SUCCESS`, its status becomes the new
+  `SUCCESS_WITH_NOTIFICATION_ERROR` value; if it was already
+  `SHEETS_FAILED`, that status is preserved (not overwritten) since the
+  Sheets failure is the more significant problem.
+- Notification is only attempted after a successful snapshot save — a
+  `COLLECTOR_FAILED`/`SNAPSHOT_FAILED` run has no new snapshot to diff, so
+  no notification is attempted for those.
+
+`PipelineRunSummary` gained `notificationStatus` (`"SENT"` | `"NO_CHANGES"` |
+`"NO_COMPARABLE_RUN"` | `"DRY_RUN"` | `null`), `notificationMessage`, and
+`notificationError`.
+
+CLI:
+
+- `pnpm telegram:test` (`src/presentation/cli/telegramTest.ts`) — sends the
+  literal text `"Desktop Agent Telegram test OK"` to `TELEGRAM_CHAT_ID`.
+  Exits with a clear message (non-zero) if `TELEGRAM_BOT_TOKEN`/
+  `TELEGRAM_CHAT_ID` aren't set.
+- `pnpm telegram:notify-latest` (`src/presentation/cli/telegramNotifyLatest.ts`)
+  — loads the latest diff via `TelegramNotifier`, sends a real message if
+  there are changes, and prints `{ status, changeCount }` plus the message
+  body if one was sent.
+- `pnpm agent:start -- --dry-run` — when `TELEGRAM_NOTIFICATIONS_ENABLED=true`
+  and changes exist, prints the planned Telegram message under "Planned
+  Telegram message (dry-run, not sent)" instead of sending it (mirrors the
+  Sheets-sync dry-run behavior from Phase 4).
+
+**Real integration test (2026-06-30), against a live Telegram bot/chat:**
+1. `pnpm telegram:test` — sent the literal test message for real; confirmed
+   delivered.
+2. `pnpm telegram:notify-latest` against the then-latest run (no diff vs. its
+   comparable previous run) — reported `{ status: "NO_CHANGES", changeCount: 0 }`
+   and sent nothing.
+3. Simulated the next collector run with exactly one campaign's `status`
+   flipped (same direct-`saveRun` technique used in the Phase 3/4
+   verifications, since this sandbox has no permanently-running live Google
+   Ads browser session) — `pnpm snapshot:diff` showed 1 `STATUS_CHANGED`
+   change, then `pnpm telegram:notify-latest` sent a real Telegram message
+   matching the documented format exactly (`{ status: "SENT", changeCount: 1 }`).
+4. `pnpm agent:start -- --dry-run` was run against the real, live AdsPower
+   client (this sandbox does have AdsPower running) — it really collected 2
+   accounts / 5 campaigns, saved a real snapshot (`collectorRunId: 15`), made
+   zero Sheets writes (`sheetsAppendedRows/updatedRows: 0`), and the
+   `TelegramNotifier` correctly evaluated that specific run's diff as
+   `NO_CHANGES` (no message planned or sent) — proving the full real
+   collector -> snapshot -> Sheets -> notifier wiring runs without crashing
+   end-to-end. The "prints planned message when changes exist" branch itself
+   is covered by the `AgentPipelineUseCase` dry-run unit test plus steps 1–3
+   above (real send proven separately, real dry-run-skips-send already
+   proven in Phase 4); live AdsPower data didn't happen to produce a diff at
+   the moment this step ran.
+
+Known limitations introduced by Phase 5 (no Telegram rate-limit retry, no
+de-duplication across runs) are tracked in the consolidated "Phase 6 backlog
+(exact items)" list at the end of this document, alongside the limitations
+carried over from earlier phases.
+
 ## Phase 4 closure
 
 Phase 4 is **CLOSED**. All real integration tests passed (see "Real
@@ -376,9 +485,28 @@ documentation only (this file, `README.md`, `ARCHITECTURE.md`).
 **Recommended Git tag:** `v0.4.0` (Phases 1–4 complete: Collector, Snapshot
 Engine + Diff Engine, Google Sheets Sync V1, Scheduler + Auto Pipeline).
 
-## Phase 5 backlog (exact items)
+## Phase 5 closure
 
-These are the only carried-over items going into Phase 5. Everything else in
+Phase 5 is **CLOSED**. All real integration tests passed against a live
+Telegram bot/chat and the live AdsPower client (see "Real integration test"
+above), and final verification was re-run clean before closing:
+
+- `pnpm test` — 94/94 passing
+- `pnpm build` — clean (`tsc -p tsconfig.json`)
+- `npx tsc -p tsconfig.json --noEmit` — clean (no type errors)
+
+No features beyond the Phase 5 spec were added — Telegram notification only,
+reusing the existing Scheduler, Snapshot, Diff, and Sheets Sync components
+unchanged. No Gmail watcher, no auto-accept, no auto pause/edit of
+campaigns, no local AI.
+
+**Recommended Git tag:** `v0.5.0` (Phases 1–5 complete: Collector, Snapshot
+Engine + Diff Engine, Google Sheets Sync V1, Scheduler + Auto Pipeline,
+Telegram Notification Engine V1).
+
+## Phase 6 backlog (exact items)
+
+These are the only carried-over items going into Phase 6. Everything else in
 this document is historical context for *why* each exists.
 
 1. **Per-account diff comparability.** `getLatestComparableRun`
@@ -399,13 +527,21 @@ this document is historical context for *why* each exists.
 4. **No retry/backoff for transient collector or Sheets failures within a
    scheduled run.** A `COLLECTOR_FAILED`/`SHEETS_FAILED` run waits for the
    next scheduled tick rather than retrying immediately. (Originally filed
-   as Known Limitation / Phase 5 Backlog.)
+   as Known Limitation / Phase 5 Backlog — note: pre-dates and is unrelated
+   to Phase 5's Telegram feature; just numbered concurrently.)
 5. **`AgentScheduler` ticks on wall-clock `setInterval` from the previous
    tick, not the previous run's finish time.** A run that takes longer than
    `AGENT_SCAN_INTERVAL_MINUTES` causes the next tick to be skipped by
    `runGuard` rather than rescheduled — correct (no overlap), but means slow
    runs can silently reduce effective frequency. (Originally filed as Known
    Limitation / Phase 5 Backlog.)
+6. **No Telegram rate-limit retry/backoff.** A 429 from the Telegram API is
+   treated like any other notifier failure (`notificationError` set,
+   `SUCCESS_WITH_NOTIFICATION_ERROR`), not retried. (New in Phase 5.)
+7. **No de-duplication across runs.** Nothing prevents the same diff from
+   being sent twice if `notifyLatestDiff` is invoked twice against the same
+   latest/previous run pair (e.g. a manual `pnpm telegram:notify-latest`
+   right after a scheduled run already sent it). (New in Phase 5.)
 
-Telegram notifications and AI-driven analysis remain unscoped future work,
-not yet broken into concrete backlog items.
+AI-driven analysis remains unscoped future work, not yet broken into
+concrete backlog items.
