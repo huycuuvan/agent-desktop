@@ -1,0 +1,20 @@
+import "dotenv/config";
+import { z } from "zod";
+
+const envSchema = z.object({
+  DATABASE_URL: z.string().min(1),
+  ADSPOWER_API_BASE_URL: z.string().url().default("http://local.adspower.net:50325"),
+  ADSPOWER_API_KEY: z.string().optional(),
+  WATCH_PROVIDER_CODE: z.string().min(1).default("QKA"),
+  GOOGLE_ADS_DATE_MODE: z.enum(["TODAY", "YESTERDAY", "LAST_2_DAYS", "AUTO"]).default("AUTO"),
+  GOOGLE_ADS_ACTION_DELAY_MS: z.coerce.number().int().positive().default(2000),
+  GOOGLE_ADS_TABLE_TIMEOUT_MS: z.coerce.number().int().positive().default(90000),
+  GOOGLE_ADS_SETTLE_DELAY_MS: z.coerce.number().int().positive().default(5000),
+  GOOGLE_ADS_STABLE_CHECKS: z.coerce.number().int().positive().default(3),
+  GOOGLE_ADS_STABLE_INTERVAL_MS: z.coerce.number().int().positive().default(1500),
+  LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace"]).default("info"),
+});
+
+export type Env = z.infer<typeof envSchema>;
+
+export const env: Env = envSchema.parse(process.env);

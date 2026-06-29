@@ -1,0 +1,8 @@
+-- CreateTable
+CREATE TABLE "ProfileScan" (
+    "id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+    "profileId" TEXT NOT NULL,
+    "profileName" TEXT NOT NULL,
+    "tabCount" INTEGER NOT NULL,
+    "scannedAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);

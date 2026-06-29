@@ -1,0 +1,16 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model ProfileScan {
+  id          Int      @id @default(autoincrement())
+  profileId   String
+  profileName String
+  tabCount    Int
+  scannedAt   DateTime @default(now())
+}
