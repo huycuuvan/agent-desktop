@@ -15,10 +15,14 @@ import { CollectGoogleAdsCampaignsUseCase } from "../../domain/usecases/CollectG
 import { detectGoogleAdsTabs } from "../../domain/services/googleAdsTabDetector.js";
 import type { GoogleAdsTab } from "../../domain/entities/GoogleAdsTab.js";
 import type { GoogleAdsAccountReadResult } from "../../domain/entities/GoogleAdsAccountReadResult.js";
+import { PrismaSnapshotRepository } from "../../infrastructure/db/PrismaSnapshotRepository.js";
+import { buildCollectorRunInput } from "../../domain/services/snapshotMapper.js";
 
 const SCREENSHOT_DIR = path.join(process.cwd(), "storage", "screenshots");
 
 async function main(): Promise<void> {
+  const startedAt = new Date();
+  const snapshotRepository = new PrismaSnapshotRepository(prisma);
   const profileRepository = new AdsPowerProfileRepositoryImpl(env.ADSPOWER_API_BASE_URL, env.ADSPOWER_API_KEY);
   const tabReader = new CdpBrowserTabReader();
   const useCase = new ListOpenProfilesWithTabsUseCase(profileRepository, tabReader);
@@ -96,6 +100,18 @@ async function main(): Promise<void> {
   console.log(`\nDetected ${allGoogleAdsTabs.length} Google Ads tab(s) across ${results.length} profile(s).`);
   console.log("\nGoogle Ads campaign collection:");
   console.log(JSON.stringify(allAccountResults, null, 2));
+
+  const finishedAt = new Date();
+  const runInput = buildCollectorRunInput(
+    startedAt,
+    finishedAt,
+    "COMPLETED",
+    env.WATCH_PROVIDER_CODE,
+    env.GOOGLE_ADS_DATE_MODE,
+    allAccountResults,
+  );
+  const runId = await snapshotRepository.saveRun(runInput);
+  console.log(`\nSaved collector_run #${runId} (${runInput.accounts.length} account snapshot(s)).`);
 }
 
 main()

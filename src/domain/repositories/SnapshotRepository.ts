@@ -1,0 +1,9 @@
+import type { CollectorRunInput, CollectorRunSummary } from "../entities/CollectorRunSnapshot.js";
+import type { RunWithCampaigns } from "../entities/CampaignDiff.js";
+
+export interface SnapshotRepository {
+  saveRun(run: CollectorRunInput): Promise<number>;
+  getLatestRunSummary(): Promise<CollectorRunSummary | null>;
+  getLatestRunWithCampaigns(): Promise<RunWithCampaigns | null>;
+  getLatestComparableRun(latestRun: RunWithCampaigns): Promise<RunWithCampaigns | null>;
+}

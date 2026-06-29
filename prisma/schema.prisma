@@ -14,3 +14,60 @@ model ProfileScan {
   tabCount    Int
   scannedAt   DateTime @default(now())
 }
+
+model CollectorRun {
+  id           Int      @id @default(autoincrement())
+  startedAt    DateTime
+  finishedAt   DateTime?
+  status       String
+  providerCode String
+  dateMode     String
+  rawJson      String?
+
+  accountSnapshots AccountSnapshot[]
+}
+
+model AccountSnapshot {
+  id                  Int      @id @default(autoincrement())
+  runId               Int
+  run                 CollectorRun @relation(fields: [runId], references: [id])
+  accountName         String?
+  customerId          String?
+  keyword             String
+  refreshed           Boolean
+  filterChipFound     Boolean
+  visibleRowCount     Int
+  totalFilteredRows   Int
+  campaignsCollected  Int
+  campaignsMissing    Int
+  reason              String?
+  screenshotPath      String?
+  fromDate            String?
+  toDate               String?
+  googleAdsDateLabel  String?
+
+  campaignSnapshots CampaignSnapshot[]
+
+  @@index([runId])
+}
+
+model CampaignSnapshot {
+  id                Int      @id @default(autoincrement())
+  accountSnapshotId Int
+  accountSnapshot   AccountSnapshot @relation(fields: [accountSnapshotId], references: [id])
+  campaignKey       String
+  campaignName      String?
+  budget            String?
+  status            String?
+  optimizationScore String?
+  account           String?
+  campaignType      String?
+  impressions       String?
+  interactions      String?
+  interactionRate   String?
+  avgCost           String?
+  cost              String?
+  conversions       String?
+
+  @@index([accountSnapshotId])
+}

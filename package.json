@@ -5,6 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "tsx src/presentation/cli/index.ts",
+    "snapshot:latest": "tsx src/presentation/cli/snapshotLatest.ts",
+    "snapshot:diff": "tsx src/presentation/cli/snapshotDiff.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/presentation/cli/index.js",
     "prisma:generate": "prisma generate",

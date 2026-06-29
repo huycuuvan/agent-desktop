@@ -47,6 +47,34 @@ It also logs a minimal `ProfileScan` row (profile id/name, tab count,
 timestamp) to the local SQLite database via Prisma, and writes one screenshot
 per collected tab to `storage/screenshots/`.
 
+Each run also persists a `CollectorRun` -> `AccountSnapshot` ->
+`CampaignSnapshot` tree to SQLite via Prisma, so collected data survives
+across runs and can be queried or diffed later. See
+[PROJECT_STATUS.md](PROJECT_STATUS.md) for the schema and write-path details.
+
+```bash
+pnpm snapshot:latest   # prints the latest run's id, account/campaign counts, failed-account count
+pnpm snapshot:diff     # diffs the latest run against the most recent comparable previous run
+```
+
+`pnpm snapshot:diff` compares the latest run against the most recent previous
+run that matches `providerCode`, `dateMode`, `fromDate`, and `toDate`,
+matching campaigns by `campaignKey` (`customerId|campaignName|account`). It
+prints a JSON object with a `summary` (counts per change type) and a
+`changes` array (`NEW_CAMPAIGN`, `REMOVED_CAMPAIGN`, `STATUS_CHANGED`,
+`BUDGET_CHANGED`, `COST_CHANGED`, `METRIC_CHANGED`), or prints
+`No comparable previous run found` if there's no matching previous run.
+
+**Known limitation:** the comparable-run match currently uses one
+`fromDate`/`toDate` per `CollectorRun` (taken from its first account), but
+`GOOGLE_ADS_DATE_MODE=AUTO` can resolve to a different date window per
+account depending on that account's timezone — so a single run can contain
+accounts with different `fromDate`/`toDate` values. This works correctly
+when all accounts in a run share the same window, but may mismatch or miss a
+valid comparison otherwise. See "Known Limitation / Phase 3 Backlog" in
+[PROJECT_STATUS.md](PROJECT_STATUS.md) for the intended fix (comparing
+per-`AccountSnapshot` instead of per-`CollectorRun`).
+
 ## How to run tests
 
 ```bash
