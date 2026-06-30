@@ -6,6 +6,7 @@
 **Phase 3 (Google Sheets Sync Engine V1):** COMPLETED
 **Phase 4 (Scheduler + Auto Pipeline):** COMPLETED
 **Phase 5 (Telegram Notification Engine V1):** COMPLETED
+**Phase 6 (Gmail Web Invitation Intake V1):** COMPLETED
 **Date:** 2026-06-30
 
 ## What Phase 1 does
@@ -504,9 +505,278 @@ campaigns, no local AI.
 Engine + Diff Engine, Google Sheets Sync V1, Scheduler + Auto Pipeline,
 Telegram Notification Engine V1).
 
-## Phase 6 backlog (exact items)
+## What Phase 6 adds
 
-These are the only carried-over items going into Phase 6. Everything else in
+Phase 6 enables the agent to receive a Google Ads Customer ID via Telegram,
+find the matching invitation email in an already-open Gmail tab inside AdsPower
+(via Playwright/CDP — **no Gmail API, no OAuth**), validate the customer ID
+exactly, click ACCEPT INVITATION, and open the Google Ads campaigns page for
+that customer.
+
+New env vars:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `GMAIL_WEB_INTAKE_ENABLED` | `false` | Master safety gate — no Gmail actions taken while `false` |
+| `DEFAULT_ADSPOWER_PROFILE_ID` | _(none)_ | Preferred AdsPower profile to search Gmail in first |
+| `GMAIL_SEARCH_TIMEOUT_MS` | `60000` | Timeout for the Gmail search step |
+| `GMAIL_ACCEPT_TIMEOUT_MS` | `90000` | Timeout for the accept + result-page navigation |
+| `TELEGRAM_BOT_USERNAME` | _(none)_ | Bot username (no `@`) for recognizing `@mention` commands |
+
+Business flow:
+
+1. Provider sends MCC/customer ID in the Telegram group.
+2. User sends one of: `@bot 5377061556`, `@bot 537-706-1556`,
+   `/accept_mcc 537-706-1556`, or `/accept_mcc` as a reply to the provider's
+   message (id parsed from the replied-to text).
+3. `CustomerIdParser` (`normalizeCustomerId`) normalizes any variant to
+   `537-706-1556` canonical form, rejecting anything that isn't 10 digits.
+4. `GmailWebSearchExecutor` iterates open AdsPower profiles via CDP, finds a
+   `mail.google.com` tab (detected by `detectGmailTabIndex`), types a Gmail
+   search query, and collects `GmailInvitationCandidate[]` (subject + body +
+   accept URL) from matching email rows.
+5. `matchInvitationCandidates` (pure) validates that exactly one candidate's
+   body customer ID equals the requested normalized ID — `NO_MATCH` and
+   `MULTIPLE_MATCHES` both halt the flow before any click.
+6. `validateInvitationBody` (pure) parses the email body for customer ID,
+   account name, access level, and rejection signals (expired/cancelled/
+   already-accepted).
+7. `GmailAcceptExecutor` navigates to the accept URL, detects the result page,
+   and returns `ACCEPTED`, `MANUAL_ACTION_REQUIRED`, or `FAILED`.
+8. `GoogleAdsOpenExecutor` opens a new tab to
+   `https://ads.google.com/aw/campaigns?ocid=<digits>&__c=<digits>`.
+9. `TelegramCommandListener` (long-poll `getUpdates`) sends the formatted
+   `GmailIntakeResult` back to the Telegram chat.
+10. Every intake attempt (including failures) is logged to the
+    `gmail_invitation_intake_logs` SQLite table via
+    `PrismaGmailIntakeLogRepository`.
+
+Statuses in `gmail_invitation_intake_logs.status`:
+`SEARCHING` · `MATCH_FOUND` · `ACCEPTED` · `ALREADY_ACCEPTED` ·
+`EXPIRED_OR_CANCELLED` · `GMAIL_TAB_NOT_FOUND` · `GMAIL_SIGN_IN_REQUIRED` ·
+`MULTIPLE_MATCHES` · `NO_MATCH` · `MANUAL_ACTION_REQUIRED` · `FAILED`
+
+Modules:
+
+- **`CustomerIdParser`** (`src/domain/services/customerIdParser.ts`) — pure.
+  `normalizeCustomerId(raw)` finds a 10-digit Google Ads customer id anywhere
+  in free text and returns it as `"537-706-1556"`, or `null` if none found.
+  `customerIdToDigits` strips dashes.
+- **`GmailTabDetector`** (`src/domain/services/gmailTabDetector.ts`) — pure.
+  `isGmailUrl`/`detectGmailTabIndex` over a `BrowserTab[]` list — same style
+  as `googleAdsTabDetector`.
+- **`GmailWebSearchExecutor`** (`src/infrastructure/browser/GmailWebSearchExecutor.ts`)
+  — implements `GmailInvitationSearcher`. Iterates AdsPower profiles over CDP,
+  locates the Gmail tab, types a search query, opens each candidate email, and
+  extracts subject/body/accept URL. Returns a `GmailSession` opaque handle.
+- **`GmailInvitationMatcher`** (`src/domain/services/gmailInvitationMatcher.ts`)
+  — pure. `matchInvitationCandidates` enforces the safety invariant: only
+  `MATCH_FOUND` when exactly one candidate's body id equals the requested id.
+- **`GmailInvitationBodyValidator`** (`src/domain/services/gmailInvitationBodyValidator.ts`)
+  — pure. `validateInvitationBody` parses body fields and detects
+  expired/cancelled/already-accepted signals before any accept click.
+- **`GmailAcceptExecutor`** (`src/infrastructure/browser/GmailAcceptExecutor.ts`)
+  — implements `GmailInvitationAccepter`. Navigates to the accept URL,
+  classifies the result page, takes screenshots on non-success outcomes.
+- **`GoogleAdsOpenExecutor`** (`src/infrastructure/browser/GoogleAdsOpenExecutor.ts`)
+  — implements `GoogleAdsOpener`. Opens a new tab to the campaigns URL built
+  by `buildGoogleAdsCampaignsUrl`.
+- **`GmailIntakeUseCase`** (`src/domain/usecases/GmailIntakeUseCase.ts`)
+  — orchestrates all ports. `.search()` is read-only (no accept); `.acceptInvitation()`
+  runs the full flow. Gated by `enabled` flag (from `GMAIL_WEB_INTAKE_ENABLED`).
+- **`PrismaGmailIntakeLogRepository`** (`src/infrastructure/db/PrismaGmailIntakeLogRepository.ts`)
+  — writes every intake attempt to `gmail_invitation_intake_logs` via Prisma.
+- **`TelegramCommandListener`** (`src/infrastructure/telegram/TelegramCommandListener.ts`)
+  — long-polls `getUpdates`, recognizes `/accept_mcc` and `@mention` messages,
+  calls `GmailIntakeUseCase.acceptInvitation`, replies with the result.
+- **`telegramCommandParser`** (`src/domain/services/telegramCommandParser.ts`)
+  — pure. `parseAcceptMccCommand` handles direct id, plain digits, and reply
+  fallback patterns. Returns `{ customerId }` or `{ error }`.
+- **`googleAdsCampaignsUrlBuilder`** (`src/domain/services/googleAdsCampaignsUrlBuilder.ts`)
+  — pure. Builds `https://ads.google.com/aw/campaigns?ocid=<d>&__c=<d>`.
+
+CLI:
+
+- `pnpm gmail:web-search -- --mcc 537-706-1556` — read-only: search + validate
+  only. Status `MATCH_FOUND` = exit 0; anything else = exit 1.
+- `pnpm gmail:web-accept -- --mcc 537-706-1556` — full flow. Status `ACCEPTED`
+  = exit 0; anything else = exit 1.
+- `pnpm telegram:bot` — long-running listener. `Ctrl+C`/`SIGTERM` to stop.
+
+Database (migration `20260630_phase6_gmail_intake`):
+
+```sql
+CREATE TABLE "gmail_invitation_intake_logs" (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+  source TEXT NOT NULL,
+  requestedCustomerId TEXT NOT NULL,
+  normalizedCustomerId TEXT,
+  gmailMessageSubject TEXT,
+  gmailMatchedCustomerId TEXT,
+  status TEXT NOT NULL,
+  reason TEXT,
+  acceptUrl TEXT,
+  adspowerProfileId TEXT,
+  screenshotPath TEXT
+);
+```
+
+`pnpm test` — 130/130 passing (36 new tests across 4 new test suites:
+`customerIdParser`, `telegramCommandParser`, `gmailInvitationMatcher`,
+`gmailInvitationBodyValidator`).
+
+`pnpm build` — clean.
+
+`pnpm gmail:web-search -- --mcc 537-706-1556` with `GMAIL_WEB_INTAKE_ENABLED=false`
+(default) returns `{ status: "FAILED", reason: "GMAIL_WEB_INTAKE_DISABLED",
+normalizedCustomerId: "537-706-1556" }` — the ID is correctly parsed and
+normalized; no browser action is taken. Set `GMAIL_WEB_INTAKE_ENABLED=true`
+with AdsPower running and a Gmail tab open to run live.
+
+Known limitations (Phase 7 backlog):
+
+- **Gmail DOM selectors are best-effort.** Gmail's web UI changes its DOM
+  structure frequently. `GmailWebSearchExecutor` uses multiple fallback
+  selectors for the search input and email body, but may need tuning on a
+  specific Gmail version or with non-default Gmail density settings. On
+  failure, a screenshot is captured to `storage/screenshots/`.
+- **Accept URL detection depends on link presence in the email.** If Gmail
+  renders the ACCEPT INVITATION button as a rendered element without a direct
+  href (rare), `GmailAcceptExecutor` falls back to `MANUAL_ACTION_REQUIRED`
+  and leaves the tab open for manual action.
+- **No retry across `MANUAL_ACTION_REQUIRED`.** The user must resolve the
+  open tab manually, then re-run the command. No auto-retry or re-polling.
+- **Single-chat listener.** `TelegramCommandListener` only responds to
+  messages in `TELEGRAM_CHAT_ID`; multi-chat or group-specific routing is
+  out of scope for V1.
+- **No duplicate-request guard.** If two `/accept_mcc` commands with the same
+  ID arrive concurrently, both will run concurrently; a
+  `MULTIPLE_MATCHES` guard in the matcher handles the race at the email
+  level, but an in-flight deduplication layer (like Phase 4's `runGuard`)
+  is not yet added to the Telegram listener.
+
+## Phase 5 closure
+
+Phase 5 is **CLOSED**. All real integration tests passed against a live
+Telegram bot/chat and the live AdsPower client (see "Real integration test"
+above), and final verification was re-run clean before closing:
+
+- `pnpm test` — 94/94 passing
+- `pnpm build` — clean (`tsc -p tsconfig.json`)
+- `npx tsc -p tsconfig.json --noEmit` — clean (no type errors)
+
+No features beyond the Phase 5 spec were added — Telegram notification only,
+reusing the existing Scheduler, Snapshot, Diff, and Sheets Sync components
+unchanged. No Gmail watcher, no auto-accept, no auto pause/edit of
+campaigns, no local AI.
+
+**Recommended Git tag:** `v0.5.0` (Phases 1–5 complete: Collector, Snapshot
+Engine + Diff Engine, Google Sheets Sync V1, Scheduler + Auto Pipeline,
+Telegram Notification Engine V1).
+
+## Phase 6 status — IN PROGRESS
+
+Phase 6 is **NOT CLOSED**. Implementation is complete and all unit tests pass,
+but live end-to-end acceptance testing is still pending for the ALREADY_ACCEPTED
+and ACCEPTED flows.
+
+### Build and test state
+
+- `pnpm test` — **180/180 passing** (86 new Phase 6 tests across 7 test files)
+- `pnpm build` — clean (`tsc -p tsconfig.json`, zero errors)
+- `npx tsc -p tsconfig.json --noEmit` — clean (no type errors)
+
+### What has been live-verified
+
+The following behaviors were confirmed with `GMAIL_WEB_INTAKE_ENABLED=true` and
+AdsPower running, using requested MCC `537-706-1556`:
+
+- `pnpm gmail:web-search -- --mcc 537-706-1556` correctly finds the Gmail tab
+  in AdsPower, types the search query into Gmail's search box, locates the
+  invitation email row by visible-row filtering (checking both subject keyword
+  and customer ID presence), opens the email, extracts the body and the ACCEPT
+  INVITATION link (`acceptUrl`), and returns `{ status: "MATCH_FOUND" }`.
+  Debug fields verified: `totalDomRows`, `visibleRowsCount`, `matchedRowsCount`,
+  `matchedRowTextPreview`, `emailBodyTextPreview`, `bodyContainsCustomerId`,
+  `acceptUrlFound`.
+
+### What is implemented but NOT yet live-tested
+
+- **ALREADY_ACCEPTED classification (Bugfix 3):** The accept page for
+  `537-706-1556` shows:
+  > "This invitation has already been accepted. Sign in to Google Ads to access
+  > this account."
+  Before Bugfix 3, this resulted in `{ status: "MANUAL_ACTION_REQUIRED" }`.
+  After Bugfix 3, `classifyAcceptPage` detects `/invitation has already been
+  accepted|already been accepted|this account has already been added/i` (checked
+  before the EXPIRED_OR_CANCELLED patterns) and `GmailAcceptExecutor` returns
+  `{ kind: "ALREADY_ACCEPTED", campaignsUrl, screenshotPath }`. The use case
+  maps this to `{ status: "ALREADY_ACCEPTED", campaignsUrl }`.
+- **campaignsUrl extraction from ocid (Bugfix 3):** The accept page URL for
+  this account follows the pattern:
+  `https://ads.google.com/nav/startacceptinvite?ivid=6467269090&ocid=8357912352&...`
+  `extractCampaignsUrlFromAcceptPageUrl` extracts `ocid=8357912352` and returns
+  `https://ads.google.com/aw/campaigns?ocid=8357912352`. Unit-tested with 5
+  cases including the exact evidence URL pattern; **not yet confirmed live**.
+- **ACCEPTED (green path):** A fresh invitation that hasn't been accepted yet —
+  meaning `classifyAcceptPage` returns `SUCCESS` or `NEEDS_CONFIRM`. This path
+  has not been exercised live because the only available test invitation was
+  already accepted.
+
+### Three bugfixes applied (all unit-tested, Bugfix 3 pending live confirmation)
+
+**Bugfix 1 — hidden-row timeout (live-verified fixed):**
+The original code iterated `rows.nth(i)` over all DOM rows including hidden
+ones. Gmail hides many rows off-screen and they time out on visibility checks.
+Fixed by extracting `selectVisibleMatchingRows` (pure, 14 tests):
+`isVisible()` per row → only rows visible AND containing both the invitation
+subject keyword AND the customer ID text are candidates → single match → open.
+
+**Bugfix 2 — empty body after row click (live-verified fixed):**
+`networkidle` fires before Gmail's SPA injects the email body into the DOM.
+`normalizeCustomerId("")` returns `null` → matcher returned `NO_MATCH`.
+Fixed by: (a) `waitForEmailBodyVisible()` waits for body selectors before
+reading; (b) `resolveCandidateMatch` fallback path: when body reading fails but
+the row preview text contains both the subject keyword and the customer ID, a
+synthesized candidate is built with `candidateReason: "BODY_READ_FALLBACK_USED"`.
+
+**Bugfix 3 — ALREADY_ACCEPTED mis-classified as MANUAL_ACTION_REQUIRED (unit-tested, pending live confirmation):**
+`/already accepted/i` does not match "already **been** accepted" (missing
+"been"). Fixed regex:
+`/invitation has already been accepted|already been accepted|this account has already been added/i`.
+Added `{ kind: "ALREADY_ACCEPTED"; campaignsUrl; screenshotPath }` as a
+distinct `GmailAcceptOutcome` kind. Use case handles it separately from
+`MANUAL_ACTION_REQUIRED` and returns `{ status: "ALREADY_ACCEPTED", campaignsUrl }`.
+ALREADY_ACCEPTED is checked before EXPIRED_OR_CANCELLED in `classifyAcceptPage`
+to prevent mis-classification when "not available" text appears on the same page.
+
+### New pure domain services added in Phase 6 bugfixes
+
+| Service | Tests | Description |
+|---------|-------|-------------|
+| `gmailRowSelector.ts` | 14 | Filters visible rows by subject keyword + customer ID; returns `{ kind, matchedIndices, visibleCount, matchedCount, firstMatchPreview }` |
+| `gmailCandidateBuilder.ts` | 14 | Primary (body OK) and fallback (body failed, row preview confirms) candidate resolution |
+| `gmailAcceptResultClassifier.ts` | 22 | `classifyAcceptPage` + `extractCampaignsUrlFromAcceptPageUrl`; ALREADY_ACCEPTED checked first |
+
+### Next live test to run (next session)
+
+```bash
+GMAIL_WEB_INTAKE_ENABLED=true pnpm gmail:web-accept -- --mcc 537-706-1556
+```
+
+Expected result: `{ status: "ALREADY_ACCEPTED", campaignsUrl: "https://ads.google.com/aw/campaigns?ocid=8357912352" }`.
+If the result is still `MANUAL_ACTION_REQUIRED`, add debug logging in
+`GmailAcceptExecutor.classifyResultPage` to print `pageText.slice(0, 500)` and
+`pageUrl` before `classifyAcceptPage` is called, then re-run to see what the
+page actually contains.
+
+**Do not tag `v0.6.0` until the ALREADY_ACCEPTED and ACCEPTED live paths are
+both confirmed.**
+
+## Phase 7 backlog (exact items)
+
+These are the only carried-over items going into Phase 7. Everything else in
 this document is historical context for *why* each exists.
 
 1. **Per-account diff comparability.** `getLatestComparableRun`

@@ -214,15 +214,64 @@ run).
 See [PROJECT_STATUS.md](PROJECT_STATUS.md) for the module breakdown
 (`TelegramMessageFormatter`, `TelegramClient`, `TelegramNotifier`).
 
+## Gmail Web Invitation Intake (Phase 6)
+
+When a provider sends a Google Ads Customer ID in the Telegram group, tag the
+bot or send a command and the agent will find the matching invitation email in
+an already-open Gmail tab inside AdsPower, validate the customer ID, click
+ACCEPT INVITATION, and open the Google Ads campaigns page.
+
+```bash
+pnpm gmail:web-search -- --mcc 537-706-1556   # find & validate, no accept
+pnpm gmail:web-accept -- --mcc 537-706-1556   # full flow: search → accept → open campaigns
+pnpm telegram:bot                              # long-poll listener for /accept_mcc commands
+```
+
+Accepted Telegram command forms (set `GMAIL_WEB_INTAKE_ENABLED=true` to enable):
+
+```
+/accept_mcc 537-706-1556          # direct command with id
+/accept_mcc 5377061556            # plain 10-digit form
+@bot 537-706-1556                 # @mention with id
+/accept_mcc                       # reply to provider's message — id parsed from reply
+```
+
+New env vars (all optional / safe defaults):
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `GMAIL_WEB_INTAKE_ENABLED` | `false` | Master safety gate — no Gmail actions taken while `false` |
+| `DEFAULT_ADSPOWER_PROFILE_ID` | _(none)_ | Preferred AdsPower profile to search Gmail in first |
+| `GMAIL_SEARCH_TIMEOUT_MS` | `60000` | Timeout for Gmail search operations |
+| `GMAIL_ACCEPT_TIMEOUT_MS` | `90000` | Timeout for accept + result-page navigation |
+| `TELEGRAM_BOT_USERNAME` | _(none)_ | Bot username (without `@`) so `@mention` commands are recognized |
+
+`gmail:web-search` returns a JSON `GmailIntakeResult` — status `MATCH_FOUND`
+on success, or one of `NO_MATCH`, `MULTIPLE_MATCHES`, `GMAIL_TAB_NOT_FOUND`,
+`GMAIL_SIGN_IN_REQUIRED`, `EXPIRED_OR_CANCELLED`, `ALREADY_ACCEPTED`, or
+`FAILED` with a `reason` field. The intake use case is gated:
+`GMAIL_WEB_INTAKE_ENABLED=false` returns `FAILED / GMAIL_WEB_INTAKE_DISABLED`
+immediately.
+
+Safety rules enforced by the `GmailIntakeUseCase`:
+- Never clicks ACCEPT INVITATION unless the email's body customer ID exactly
+  matches the requested normalized ID.
+- Never accepts when zero or multiple invitation emails match.
+- Never accepts when the invitation body signals expired, cancelled, or
+  already-accepted state.
+- Never deletes or modifies emails.
+- Leaves the Gmail tab open (never closes the user's browser) on
+  `MANUAL_ACTION_REQUIRED` so the user can inspect it directly.
+- Every intake attempt is logged to `gmail_invitation_intake_logs` (SQLite)
+  with full status, reason, matched subject, and screenshot path on failure.
+
 ## Project status
 
-Phases 1–5 (Desktop Collector, Snapshot + Diff Engine, Google Sheets Sync V1,
-Scheduler + Auto Pipeline, Telegram Notification Engine V1) are complete and
-have passed real integration testing against live AdsPower profiles, a live
-Google Sheets spreadsheet, and a live Telegram bot/chat. See
+Phases 1–5 are complete. Phase 6 is **IN PROGRESS** — implementation and unit
+tests are complete (180/180 passing), but live end-to-end acceptance for the
+ALREADY_ACCEPTED and ACCEPTED flows is still pending. See
 [PROJECT_STATUS.md](PROJECT_STATUS.md) for the full per-phase writeup, known
-limitations, and the exact Phase 6 backlog. Recommended release tag for this
-state: **`v0.5.0`**.
+limitations, and the next live test to run.
 
 ## How to run tests
 
@@ -256,6 +305,10 @@ the full table with defaults. Summary:
 - `AGENT_RUN_ON_START` — whether `pnpm agent:start` runs the pipeline immediately (default `true`).
 - `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` — required only for `pnpm telegram:test`/`pnpm telegram:notify-latest` and for Telegram alerts from `pnpm agent:start`.
 - `TELEGRAM_NOTIFICATIONS_ENABLED` — `false` (default) skips Telegram entirely from `pnpm agent:start`; `true` sends an alert after each run if the diff has changes.
+- `GMAIL_WEB_INTAKE_ENABLED` — `false` (default); must be `true` for any Gmail intake action to be taken.
+- `DEFAULT_ADSPOWER_PROFILE_ID` — optional; searched first when looking for an open Gmail tab.
+- `GMAIL_SEARCH_TIMEOUT_MS` / `GMAIL_ACCEPT_TIMEOUT_MS` — timeouts for the Gmail search and accept steps (defaults: `60000` / `90000`).
+- `TELEGRAM_BOT_USERNAME` — optional; bot username (no `@`) for recognizing `@mention` commands.
 
 ## Meaning of output fields
 

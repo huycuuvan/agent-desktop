@@ -25,6 +25,10 @@ src/
       CollectorRunner.ts            # collect(): GoogleAdsAccountReadResult[]
       SheetsSyncer.ts               # sync(dryRun): SheetsSyncOutcome
       Notifier.ts                   # notifyLatestDiff(dryRun): NotificationResult
+      GmailInvitationSearcher.ts    # search(normalizedCustomerId): GmailSearchOutcome (+ GmailSession opaque handle)
+      GmailInvitationAccepter.ts    # accept(session, candidate): GmailAcceptOutcome
+      GoogleAdsOpener.ts            # openCampaigns(session, customerId): { opened, url }
+      GmailIntakeLogRepository.ts   # create(GmailIntakeLogInput): void
     services/                      # Pure functions — fully unit-testable, no I/O
       googleAdsUrlParser.ts        # isGoogleAdsUrl, parseGoogleAdsUrl, parseAccountNameFromTitle
       googleAdsTabDetector.ts      # detectGoogleAdsTabs
@@ -37,10 +41,20 @@ src/
       SheetsSyncPlanner.ts         # decideRowAction (APPEND/UPDATE/SKIP), planSync
       runGuard.ts                  # createRunGuard — prevents overlapping async runs
       TelegramMessageFormatter.ts  # formatTelegramMessage — builds the alert text, or null if no changes
+      customerIdParser.ts          # normalizeCustomerId (any variant -> "537-706-1556"), customerIdToDigits
+      gmailTabDetector.ts          # isGmailUrl, detectGmailTabIndex — pure, over BrowserTab[]
+      gmailInvitationMatcher.ts    # matchInvitationCandidates — MATCH_FOUND | MULTIPLE_MATCHES | NO_MATCH
+      gmailInvitationBodyValidator.ts # validateInvitationBody — VALID | EXPIRED_OR_CANCELLED | ALREADY_ACCEPTED | INVALID_FORMAT
+      telegramCommandParser.ts     # parseAcceptMccCommand — /accept_mcc, @mention, reply fallback
+      googleAdsCampaignsUrlBuilder.ts # buildGoogleAdsCampaignsUrl
+      gmailRowSelector.ts          # selectVisibleMatchingRows — filters DOM rows by visibility + subject keyword + customer ID; returns { kind, matchedIndices, visibleCount, matchedCount }
+      gmailCandidateBuilder.ts     # resolveCandidateMatch — primary (body OK) and fallback (body failed, row preview confirms) candidate resolution; sets candidateReason: "BODY_READ_FALLBACK_USED"
+      gmailAcceptResultClassifier.ts # classifyAcceptPage (ALREADY_ACCEPTED | SUCCESS | EXPIRED_OR_CANCELLED | NEEDS_CONFIRM | UNCLEAR) + extractCampaignsUrlFromAcceptPageUrl; ALREADY_ACCEPTED checked before EXPIRED
     usecases/                      # Orchestrate ports; still no I/O of their own
       ListOpenProfilesWithTabsUseCase.ts
       CollectGoogleAdsCampaignsUseCase.ts
       AgentPipelineUseCase.ts       # collector -> snapshot -> sheets sync -> notify, with failure handling
+      GmailIntakeUseCase.ts         # search | acceptInvitation: parse id -> find Gmail tab -> search -> validate -> accept -> open ads
 
   infrastructure/                  # Concrete adapters — Playwright, HTTP, Prisma, Sheets API, Telegram API, Pino
     adspower/
@@ -54,18 +68,23 @@ src/
       googleAdsTableReadiness.ts    # GoogleAdsTableReadinessWaiter
       CampaignTableReader.ts
       GoogleAdsCollector.ts         # orchestrates the above per tab
+      GmailWebSearchExecutor.ts     # GmailInvitationSearcher impl — finds Gmail tab, searches, collects candidates
+      GmailAcceptExecutor.ts        # GmailInvitationAccepter impl — navigates to accept URL, classifies result
+      GoogleAdsOpenExecutor.ts      # GoogleAdsOpener impl — opens campaigns URL in new tab
     collector/
       GoogleAdsCollectorRunner.ts   # CollectorRunner impl — wires AdsPower+CDP+collector, shared by `dev` and `agent:start`
     db/
       prismaClient.ts
-      PrismaSnapshotRepository.ts   # SnapshotRepository impl (SQLite via Prisma)
+      PrismaSnapshotRepository.ts      # SnapshotRepository impl (SQLite via Prisma)
+      PrismaGmailIntakeLogRepository.ts # GmailIntakeLogRepository impl (gmail_invitation_intake_logs table)
     sheets/
       SheetsClient.ts               # thin Google Sheets v4 API wrapper (service-account auth)
       SheetsSyncExecutor.ts         # reads sheet, plans via SheetsSyncPlanner, applies writes (or not, if dryRun)
       SnapshotSheetsSyncer.ts       # SheetsSyncer impl — reads latest snapshot, syncs it via SheetsSyncExecutor
     telegram/
-      TelegramClient.ts             # thin Telegram Bot API wrapper (sendMessage via global fetch)
+      TelegramClient.ts             # thin Telegram Bot API wrapper (sendMessage + getUpdates via global fetch)
       TelegramNotifier.ts           # Notifier impl — loads latest diff, formats, sends (or plans, if dryRun)
+      TelegramCommandListener.ts    # long-poll getUpdates, parse /accept_mcc commands, call GmailIntakeUseCase, reply
     scheduler/
       AgentScheduler.ts             # interval driver (injectable timer): run-on-start + setInterval + stop
     logger/
@@ -82,6 +101,10 @@ src/
       telegramTest.ts              # `pnpm telegram:test` — sends a literal test message
       telegramNotifyLatest.ts      # `pnpm telegram:notify-latest` — sends a real alert for the latest diff, if any
       agentStart.ts                # `pnpm agent:start` [-- --dry-run] — scheduled collector -> snapshot -> sheets -> notify pipeline
+      gmailWebSearch.ts            # `pnpm gmail:web-search -- --mcc <id>` — read-only intake search
+      gmailWebAccept.ts            # `pnpm gmail:web-accept -- --mcc <id>` — full intake: search -> accept -> open ads
+      telegramBot.ts               # `pnpm telegram:bot` — long-running /accept_mcc command listener
+      gmailIntakeWiring.ts         # shared factory: wires AdsPower + browser executors + DB into GmailIntakeUseCase
 ```
 
 ## Data flow
@@ -176,6 +199,47 @@ around this chain. It adds no new repository methods or schema — it reuses
 the exact `SnapshotRepository` methods the Phase 2 Diff Engine already
 exposes.
 
+### Gmail invitation intake (Phase 6)
+
+```
+Telegram message (/accept_mcc 537-706-1556 | @bot 5377061556 | /accept_mcc as reply)
+       |
+       v
+TelegramCommandListener.handleCommand
+       |
+       v
+telegramCommandParser.parseAcceptMccCommand   -> { customerId } | { error }
+       |
+       v
+GmailIntakeUseCase.acceptInvitation(normalizedCustomerId, "telegram")
+       |
+       1. normalizeCustomerId              -> "537-706-1556" | null (FAILED if null)
+       2. enabled check                   -> FAILED/GMAIL_WEB_INTAKE_DISABLED if false
+       3. GmailInvitationSearcher.search  -> iterates AdsPower profiles over CDP
+            detectGmailTabIndex           -> finds mail.google.com tab
+            isSignInPage                  -> SIGN_IN_REQUIRED guard
+            Gmail search box              -> types query, collects GmailInvitationCandidate[]
+            -> GMAIL_TAB_NOT_FOUND | SIGN_IN_REQUIRED | FOUND{candidates, profile, session}
+       4. matchInvitationCandidates(candidates, normalizedId)
+            -> NO_MATCH | MULTIPLE_MATCHES | MATCH_FOUND{candidate}
+       5. validateInvitationBody(subject, body)
+            -> EXPIRED_OR_CANCELLED | ALREADY_ACCEPTED | INVALID_FORMAT | VALID
+       6. GmailInvitationAccepter.accept(session, candidate)
+            -> navigates acceptUrl, reads result page text
+            -> ACCEPTED | MANUAL_ACTION_REQUIRED | FAILED
+       7. GoogleAdsOpener.openCampaigns(session, normalizedId)
+            -> opens new tab to buildGoogleAdsCampaignsUrl(normalizedId)
+       8. GmailIntakeLogRepository.create(log)  [logged at every status transition]
+       -> GmailIntakeResult { status, reason, normalizedCustomerId, campaignsUrl, ... }
+       |
+       v
+TelegramCommandListener -> client.sendMessage(chatId, formattedResult)
+```
+
+`GmailSession` is an opaque `unknown` handle in the domain layer. Only
+infrastructure adapters cast it to `{ browser: Browser; page: Page }`. Domain
+code (ports, use case) never imports from `playwright`.
+
 ### Scheduled pipeline (Phase 4, extended in Phase 5)
 
 ```
@@ -232,6 +296,18 @@ Phase 1–4 components.
 | **TelegramClient** | Thin Telegram Bot API wrapper (`sendMessage` via global `fetch`); no business logic |
 | **TelegramNotifier** | `Notifier` port impl; loads the latest diff via existing `SnapshotRepository`/`CampaignDiffEngine` and sends (or plans, if `dryRun`) the formatted message |
 | **AgentPipelineUseCase** | Orchestrates `CollectorRunner` -> `SnapshotRepository` -> `SheetsSyncer` -> `Notifier` with the failure-handling rules described above |
+| **CustomerIdParser** (`customerIdParser.ts`) | Pure: `normalizeCustomerId` scans free text for a 10-digit Google Ads customer id and returns it as `"537-706-1556"` or `null`; `customerIdToDigits` strips dashes |
+| **GmailTabDetector** (`gmailTabDetector.ts`) | Pure: `isGmailUrl` / `detectGmailTabIndex` — locates an open Gmail tab in a `BrowserTab[]` list |
+| **GmailWebSearchExecutor** | `GmailInvitationSearcher` port impl; iterates AdsPower profiles over CDP, finds Gmail tab, runs a search query, collects `GmailInvitationCandidate[]`, returns an opaque `GmailSession` |
+| **GmailInvitationMatcher** (`gmailInvitationMatcher.ts`) | Pure: `matchInvitationCandidates` enforces the safety invariant — `MATCH_FOUND` only when exactly one candidate's body id matches the requested id |
+| **GmailInvitationBodyValidator** (`gmailInvitationBodyValidator.ts`) | Pure: `validateInvitationBody` parses body fields and detects expired/cancelled/already-accepted signals before any accept click |
+| **GmailAcceptExecutor** | `GmailInvitationAccepter` port impl; navigates to accept URL, classifies the result page, takes screenshots on non-success outcomes |
+| **GoogleAdsOpenExecutor** | `GoogleAdsOpener` port impl; opens the Google Ads campaigns URL in a new browser tab via the live `GmailSession` context |
+| **GmailIntakeUseCase** | Orchestrates `GmailInvitationSearcher` -> `matchInvitationCandidates` -> `validateInvitationBody` -> `GmailInvitationAccepter` -> `GoogleAdsOpener`; gated by `GMAIL_WEB_INTAKE_ENABLED`; every status transition logged via `GmailIntakeLogRepository` |
+| **PrismaGmailIntakeLogRepository** | `GmailIntakeLogRepository` port impl; persists every intake attempt to `gmail_invitation_intake_logs` via Prisma |
+| **TelegramCommandListener** | Long-polls `getUpdates`, recognizes `/accept_mcc` and `@mention` commands via `telegramCommandParser`, calls `GmailIntakeUseCase.acceptInvitation`, replies with formatted result |
+| **telegramCommandParser** | Pure: `parseAcceptMccCommand` handles direct id, plain-digit, and reply-fallback command forms |
+| **googleAdsCampaignsUrlBuilder** | Pure: builds `https://ads.google.com/aw/campaigns?ocid=<digits>&__c=<digits>` |
 
 ## Rules
 

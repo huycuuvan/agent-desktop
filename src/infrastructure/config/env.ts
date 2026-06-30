@@ -31,6 +31,14 @@ const envSchema = z.object({
     .enum(["true", "false"])
     .default("false")
     .transform((value) => value === "true"),
+  GMAIL_WEB_INTAKE_ENABLED: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((value) => value === "true"),
+  DEFAULT_ADSPOWER_PROFILE_ID: z.string().optional(),
+  GMAIL_SEARCH_TIMEOUT_MS: z.coerce.number().int().positive().default(60000),
+  GMAIL_ACCEPT_TIMEOUT_MS: z.coerce.number().int().positive().default(90000),
+  TELEGRAM_BOT_USERNAME: z.string().optional(),
 });
 
 export type Env = z.infer<typeof envSchema>;

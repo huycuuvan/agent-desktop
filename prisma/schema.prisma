@@ -71,3 +71,22 @@ model CampaignSnapshot {
 
   @@index([accountSnapshotId])
 }
+
+model GmailInvitationIntakeLog {
+  id                    Int      @id @default(autoincrement())
+  createdAt             DateTime @default(now())
+  source                String
+  requestedCustomerId   String
+  normalizedCustomerId  String?
+  gmailMessageSubject   String?
+  gmailMatchedCustomerId String?
+  status                String
+  reason                String?
+  acceptUrl             String?
+  adspowerProfileId     String?
+  screenshotPath        String?
+
+  @@map("gmail_invitation_intake_logs")
+  @@index([normalizedCustomerId])
+  @@index([status])
+}
