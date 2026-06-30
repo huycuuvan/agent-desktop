@@ -22,7 +22,14 @@ export function buildGmailIntakeUseCase(): GmailIntakeUseCase {
     env.DEFAULT_ADSPOWER_PROFILE_ID,
   );
 
-  const accepter = new GmailAcceptExecutor(env.GMAIL_ACCEPT_TIMEOUT_MS, SCREENSHOT_DIR);
+  const accepter = new GmailAcceptExecutor(
+    env.GMAIL_ACCEPT_TIMEOUT_MS,
+    SCREENSHOT_DIR,
+    env.GMAIL_ACCEPT_PAGE_TIMEOUT_MS,
+    env.GMAIL_ACCEPT_SETTLE_DELAY_MS,
+    env.GMAIL_CAMPAIGNS_PAGE_TIMEOUT_MS,
+    env.GMAIL_CAMPAIGNS_SETTLE_DELAY_MS,
+  );
   const adsOpener = new GoogleAdsOpenExecutor();
   const logRepository = new PrismaGmailIntakeLogRepository(prisma);
 

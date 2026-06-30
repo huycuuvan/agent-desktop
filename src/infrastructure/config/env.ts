@@ -38,6 +38,10 @@ const envSchema = z.object({
   DEFAULT_ADSPOWER_PROFILE_ID: z.string().optional(),
   GMAIL_SEARCH_TIMEOUT_MS: z.coerce.number().int().positive().default(60000),
   GMAIL_ACCEPT_TIMEOUT_MS: z.coerce.number().int().positive().default(90000),
+  GMAIL_ACCEPT_PAGE_TIMEOUT_MS: z.coerce.number().int().positive().default(90000),
+  GMAIL_ACCEPT_SETTLE_DELAY_MS: z.coerce.number().int().positive().default(3000),
+  GMAIL_CAMPAIGNS_PAGE_TIMEOUT_MS: z.coerce.number().int().positive().default(120000),
+  GMAIL_CAMPAIGNS_SETTLE_DELAY_MS: z.coerce.number().int().positive().default(5000),
   TELEGRAM_BOT_USERNAME: z.string().optional(),
 });
 

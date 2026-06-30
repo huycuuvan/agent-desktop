@@ -45,5 +45,6 @@ export interface GmailIntakeResult {
   gmailMessageSubject?: string | null;
   acceptUrl?: string | null;
   campaignsUrl?: string | null;
+  campaignsPageReady?: boolean | null;
   screenshotPath?: string | null;
 }

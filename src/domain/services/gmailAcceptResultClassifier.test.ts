@@ -56,8 +56,24 @@ describe("classifyAcceptPage — EXPIRED_OR_CANCELLED", () => {
     assert.equal(classifyAcceptPage("This invitation has expired.", false), "EXPIRED_OR_CANCELLED");
   });
 
+  it("classifies 'invitation has expired'", () => {
+    assert.equal(classifyAcceptPage("The invitation has expired.", false), "EXPIRED_OR_CANCELLED");
+  });
+
   it("classifies 'cancelled'", () => {
     assert.equal(classifyAcceptPage("The invitation was cancelled.", false), "EXPIRED_OR_CANCELLED");
+  });
+
+  it("classifies 'invitation has been cancelled'", () => {
+    assert.equal(classifyAcceptPage("The invitation has been cancelled.", false), "EXPIRED_OR_CANCELLED");
+  });
+
+  it("classifies 'invitation was revoked'", () => {
+    assert.equal(classifyAcceptPage("The invitation was revoked.", false), "EXPIRED_OR_CANCELLED");
+  });
+
+  it("classifies 'invitation is no longer available'", () => {
+    assert.equal(classifyAcceptPage("The invitation is no longer available.", false), "EXPIRED_OR_CANCELLED");
   });
 
   it("classifies 'no longer valid'", () => {
@@ -69,6 +85,42 @@ describe("classifyAcceptPage — EXPIRED_OR_CANCELLED", () => {
     // ALREADY_ACCEPTED must win because it is checked first.
     const text = "This invitation has already been accepted. This offer is no longer available.";
     assert.equal(classifyAcceptPage(text, false), "ALREADY_ACCEPTED");
+  });
+});
+
+describe("classifyAcceptPage — SIGN_IN_REQUIRED", () => {
+  it("classifies when hasSignInIndicator=true and no accepted/expired text and no confirm button", () => {
+    assert.equal(classifyAcceptPage("Please sign in to continue.", false, true), "SIGN_IN_REQUIRED");
+  });
+
+  it("classifies via text pattern 'Sign in to Google' when no confirm button", () => {
+    assert.equal(classifyAcceptPage("Sign in to Google Ads to access this account.", false, false), "SIGN_IN_REQUIRED");
+  });
+
+  it("ALREADY_ACCEPTED beats SIGN_IN_REQUIRED even when sign-in indicator present", () => {
+    const text = "This invitation has already been accepted. Sign in to Google Ads to access this account.";
+    assert.equal(classifyAcceptPage(text, false, true), "ALREADY_ACCEPTED");
+  });
+
+  it("EXPIRED_OR_CANCELLED beats SIGN_IN_REQUIRED", () => {
+    const text = "The invitation has expired. Sign in to Google.";
+    assert.equal(classifyAcceptPage(text, false, true), "EXPIRED_OR_CANCELLED");
+  });
+
+  it("welcome+continue page: NEEDS_CONFIRM beats SIGN_IN_REQUIRED when confirm button is present", () => {
+    // Regression: "To accept the invitation and sign in to Google Ads, click Continue."
+    // contains sign-in phrasing but must be NEEDS_CONFIRM because the Continue button exists.
+    const text =
+      "Hello and welcome to Google Ads!\n" +
+      "To accept the invitation and sign in to Google Ads, click Continue.";
+    assert.equal(classifyAcceptPage(text, true, false), "NEEDS_CONFIRM");
+  });
+
+  it("welcome+continue page with sign-in indicator: NEEDS_CONFIRM still wins", () => {
+    const text =
+      "Hello and welcome to Google Ads!\n" +
+      "To accept the invitation and sign in to Google Ads, click Continue.";
+    assert.equal(classifyAcceptPage(text, true, true), "NEEDS_CONFIRM");
   });
 });
 
@@ -92,13 +144,13 @@ describe("extractCampaignsUrlFromAcceptPageUrl", () => {
   it("extracts ocid from accept page URL — matches evidence URL pattern", () => {
     const pageUrl = "https://ads.google.com/aw/um/accept?ocid=8357912352&authuser=0";
     const url = extractCampaignsUrlFromAcceptPageUrl(pageUrl, NORMALIZED_ID);
-    assert.equal(url, "https://ads.google.com/aw/campaigns?ocid=8357912352");
+    assert.equal(url, "https://ads.google.com/aw/campaigns?ocid=8357912352&workspaceId=0");
   });
 
   it("uses ocid over the normalized customer id when both are available", () => {
     const pageUrl = "https://ads.google.com/aw/um/accept?ocid=9999999999";
     const url = extractCampaignsUrlFromAcceptPageUrl(pageUrl, NORMALIZED_ID);
-    assert.equal(url, "https://ads.google.com/aw/campaigns?ocid=9999999999");
+    assert.equal(url, "https://ads.google.com/aw/campaigns?ocid=9999999999&workspaceId=0");
   });
 
   it("falls back to buildGoogleAdsCampaignsUrl when URL has no ocid param", () => {

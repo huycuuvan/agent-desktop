@@ -109,22 +109,33 @@ export class GmailIntakeUseCase {
         "ALREADY_ACCEPTED",
         undefined,
         acceptOutcome.campaignsUrl ?? undefined,
+        acceptOutcome.campaignsPageReady,
       );
     }
     if (acceptOutcome.kind === "MANUAL_ACTION_REQUIRED") {
-      return this.finish({ ...withCandidate, screenshotPath: acceptOutcome.screenshotPath }, "MANUAL_ACTION_REQUIRED");
+      return this.finish(
+        { ...withCandidate, screenshotPath: acceptOutcome.screenshotPath },
+        "MANUAL_ACTION_REQUIRED",
+        acceptOutcome.reason,
+      );
+    }
+    if (acceptOutcome.kind === "SIGN_IN_REQUIRED") {
+      return this.finish(withCandidate, "GMAIL_SIGN_IN_REQUIRED");
+    }
+    if (acceptOutcome.kind === "ACCEPT_PAGE_NOT_READY_TIMEOUT") {
+      return this.finish(withCandidate, "FAILED", "ACCEPT_PAGE_NOT_READY_TIMEOUT");
     }
     if (acceptOutcome.kind === "FAILED") {
       return this.finish({ ...withCandidate, screenshotPath: acceptOutcome.screenshotPath }, "FAILED", acceptOutcome.reason);
     }
 
-    const adsResult = await this.adsOpener.openCampaigns(searchOutcome.session, normalized);
-
+    // acceptOutcome.kind === "ACCEPTED"
     return this.finish(
       { ...withCandidate, acceptUrl: acceptOutcome.acceptUrl ?? withCandidate.acceptUrl },
       "ACCEPTED",
       undefined,
-      adsResult.url,
+      acceptOutcome.campaignsUrl ?? undefined,
+      acceptOutcome.campaignsPageReady,
     );
   }
 
@@ -133,6 +144,7 @@ export class GmailIntakeUseCase {
     status: GmailIntakeStatus,
     reason?: string,
     campaignsUrl?: string,
+    campaignsPageReady?: boolean,
   ): Promise<GmailIntakeResult> {
     await this.log(fields, status, reason);
     return {
@@ -142,6 +154,7 @@ export class GmailIntakeUseCase {
       gmailMessageSubject: fields.gmailMessageSubject ?? null,
       acceptUrl: fields.acceptUrl ?? null,
       campaignsUrl: campaignsUrl ?? null,
+      campaignsPageReady: campaignsPageReady ?? null,
       screenshotPath: fields.screenshotPath ?? null,
     };
   }
