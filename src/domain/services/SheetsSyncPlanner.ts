@@ -42,5 +42,17 @@ export function decideRowAction(existing: ExistingSheetRow | undefined, incoming
 
 export function planSync(existingRows: ExistingSheetRow[], incomingRows: IncomingSheetRow[]): SyncAction[] {
   const existingByKey = new Map(existingRows.map((row) => [row.campaignKey, row]));
-  return incomingRows.map((incoming) => decideRowAction(existingByKey.get(incoming.campaignKey), incoming));
+
+  // Deduplicate incomingRows by campaignKey — keep first occurrence.
+  const seenKeys = new Set<string>();
+  const uniqueIncoming = incomingRows.filter((row) => {
+    if (seenKeys.has(row.campaignKey)) {
+      console.warn(`[SheetsSyncPlanner] Duplicate incomingRow skipped: ${row.campaignKey}`);
+      return false;
+    }
+    seenKeys.add(row.campaignKey);
+    return true;
+  });
+
+  return uniqueIncoming.map((incoming) => decideRowAction(existingByKey.get(incoming.campaignKey), incoming));
 }

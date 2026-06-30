@@ -1,6 +1,6 @@
 import path from "node:path";
 import { mkdir } from "node:fs/promises";
-import type { Browser, BrowserContext, Page } from "playwright";
+import type { Browser, Page } from "playwright";
 import type { GmailInvitationAccepter, GmailAcceptOutcome } from "../../domain/repositories/GmailInvitationAccepter.js";
 import type { GmailSession } from "../../domain/repositories/GmailInvitationSearcher.js";
 import type { GmailInvitationCandidate } from "../../domain/entities/GmailInvitation.js";
@@ -8,6 +8,8 @@ import {
   classifyAcceptPage,
   extractCampaignsUrlFromAcceptPageUrl,
 } from "../../domain/services/gmailAcceptResultClassifier.js";
+import { BrowserTabManager, extractCustomerIdFromUrl } from "./BrowserTabManager.js";
+import { customerIdToDigits } from "../../domain/services/customerIdParser.js";
 import { logger } from "../logger/logger.js";
 
 interface InternalSession {
@@ -29,7 +31,6 @@ const CAMPAIGNS_TABLE_SELECTORS = [
   '[role="grid"][aria-label*="ampaign"]',
   'table[aria-label*="ampaign"]',
   '[data-campaign-table]',
-  // Generic Google Ads data table that appears on the campaigns list
   '.KF4T6b',
   '[role="grid"]',
 ];
@@ -42,17 +43,25 @@ const CAMPAIGNS_NAV_SELECTORS = [
 ];
 
 const CAMPAIGNS_URL_PATTERN = /\/aw\/campaigns/;
-
 const CAMPAIGNS_NAV_RETRY_LIMIT = 3;
+
+/**
+ * Statuses after which the accept tab can be safely closed:
+ * the user has no further need to inspect it.
+ */
+const CLOSE_ACCEPT_TAB_KINDS = new Set<GmailAcceptOutcome["kind"]>([
+  "ACCEPTED",
+  "ALREADY_ACCEPTED",
+]);
 
 export class GmailAcceptExecutor implements GmailInvitationAccepter {
   constructor(
     private readonly acceptTimeoutMs: number,
     private readonly screenshotDir: string,
     private readonly acceptPageTimeoutMs: number = 90000,
-    private readonly acceptSettleDelayMs: number = 3000,
+    private readonly acceptSettleDelayMs: number = 1500,
     private readonly campaignsPageTimeoutMs: number = 120000,
-    private readonly campaignsSettleDelayMs: number = 5000,
+    private readonly campaignsSettleDelayMs: number = 2000,
   ) {}
 
   async accept(session: GmailSession, candidate: GmailInvitationCandidate): Promise<GmailAcceptOutcome> {
@@ -65,7 +74,6 @@ export class GmailAcceptExecutor implements GmailInvitationAccepter {
       return { kind: "MANUAL_ACTION_REQUIRED", screenshotPath };
     }
 
-    // Open the accept URL in a new tab — never navigate the Gmail tab away from Gmail.
     const context = browser.contexts()[0];
     if (!context) {
       return { kind: "FAILED", reason: "No browser context available", screenshotPath: null };
@@ -76,6 +84,7 @@ export class GmailAcceptExecutor implements GmailInvitationAccepter {
       acceptPage = await context.newPage();
       await acceptPage.goto(acceptUrl, { waitUntil: "domcontentloaded", timeout: this.acceptPageTimeoutMs });
 
+      // Wait for the page body to have enough content to classify.
       const ready = await this.waitForAcceptPageReady(acceptPage);
       if (!ready) {
         logger.warn({ acceptUrl }, "GmailAcceptExecutor: accept page not ready within timeout");
@@ -86,12 +95,45 @@ export class GmailAcceptExecutor implements GmailInvitationAccepter {
       const normalizedCustomerId = candidate.body.match(/\d{3}-\d{3}-\d{4}/)?.at(0) ?? "";
       const outcome = await this.classifyAndAct(acceptPage, acceptUrl, normalizedCustomerId);
 
-      // After a successful accept, open the campaigns page in a new tab and wait for it.
+      // Reuse/open the campaign tab, then close the accept tab on success.
       if (outcome.kind === "ACCEPTED" || outcome.kind === "ALREADY_ACCEPTED") {
         const campaignsUrl =
-          outcome.campaignsUrl ?? extractCampaignsUrlFromAcceptPageUrl(acceptPage.url(), normalizedCustomerId);
+          outcome.campaignsUrl ??
+          extractCampaignsUrlFromAcceptPageUrl(acceptPage.url(), normalizedCustomerId);
 
-        const campaignsResult = await this.openAndWaitForCampaignsPage(context, campaignsUrl);
+        const tabManager = new BrowserTabManager(browser);
+
+        // Extract ocid from the campaigns URL directly — do NOT rely on the body regex
+        // which may be empty if the email format doesn't match /\d{3}-\d{3}-\d{4}/.
+        const customerIdDigits =
+          (campaignsUrl ? extractCustomerIdFromUrl(campaignsUrl) : null) ??
+          (normalizedCustomerId ? customerIdToDigits(normalizedCustomerId) : "");
+
+        logger.info(
+          { campaignsUrl, customerIdDigits },
+          "GmailAcceptExecutor: opening campaigns page after accept",
+        );
+
+        const campaignsResult = await this.openAndWaitForCampaignsPage(
+          tabManager,
+          campaignsUrl,
+          customerIdDigits,
+        );
+
+        // Close accept tab after confirmed success.
+        if (campaignsResult.ready && acceptPage && !acceptPage.isClosed()) {
+          logger.info({ acceptUrl }, "GmailAcceptExecutor: closing accept tab after success");
+          await acceptPage.close().catch(() => undefined);
+        }
+
+        // Remove any duplicate campaign tabs for this ocid that may remain.
+        if (campaignsResult.ready && customerIdDigits) {
+          await tabManager
+            .cleanupDuplicateCampaignTabs(false, customerIdDigits)
+            .catch((err) =>
+              logger.warn({ err, customerIdDigits }, "GmailAcceptExecutor: cleanup duplicate tabs failed"),
+            );
+        }
 
         if (!campaignsResult.ready) {
           logger.warn({ campaignsUrl }, "GmailAcceptExecutor: campaigns page not ready after accept");
@@ -102,10 +144,36 @@ export class GmailAcceptExecutor implements GmailInvitationAccepter {
           };
         }
 
-        if (outcome.kind === "ACCEPTED") {
-          return { ...outcome, campaignsUrl, campaignsPageReady: true };
-        }
         return { ...outcome, campaignsUrl, campaignsPageReady: true };
+      }
+
+      // Part 9: if MANUAL_ACTION_REQUIRED but we have an ocid, try opening the campaigns page directly.
+      if (outcome.kind === "MANUAL_ACTION_REQUIRED") {
+        const ocidFromAcceptUrl = extractCustomerIdFromUrl(acceptPage.url());
+        const ocid = ocidFromAcceptUrl ?? (normalizedCustomerId ? customerIdToDigits(normalizedCustomerId) : null);
+        if (ocid) {
+          const campaignsUrl = `https://ads.google.com/aw/campaigns?ocid=${ocid}`;
+          const tabManager = new BrowserTabManager(browser);
+          const campaignsResult = await this.openAndWaitForCampaignsPage(tabManager, campaignsUrl, ocid);
+          if (campaignsResult.ready) {
+            logger.info(
+              { ocid, campaignsUrl },
+              "GmailAcceptExecutor: campaigns page opened directly — treating as ALREADY_ACCEPTED",
+            );
+            if (acceptPage && !acceptPage.isClosed()) {
+              await acceptPage.close().catch(() => undefined);
+            }
+            await tabManager
+              .cleanupDuplicateCampaignTabs(false, ocid)
+              .catch(() => undefined);
+            return {
+              kind: "ALREADY_ACCEPTED",
+              campaignsUrl,
+              screenshotPath: null,
+              campaignsPageReady: true,
+            };
+          }
+        }
       }
 
       return outcome;
@@ -120,24 +188,23 @@ export class GmailAcceptExecutor implements GmailInvitationAccepter {
   // Accept page helpers
   // ---------------------------------------------------------------------------
 
-  /**
-   * Waits for the accept page body to be non-empty and showing a classifiable state.
-   * Returns false on timeout.
-   */
   private async waitForAcceptPageReady(page: Page): Promise<boolean> {
-    const deadline = Date.now() + this.acceptPageTimeoutMs;
-    const pollMs = 1500;
+    try {
+      // Wait for the body to contain enough text for classification.
+      await page.waitForFunction(
+        () => {
+          const text = document.body?.textContent ?? "";
+          return text.trim().length > 50;
+        },
+        { timeout: this.acceptPageTimeoutMs, polling: 1000 },
+      );
 
-    while (Date.now() < deadline) {
-      const bodyText = (await page.textContent("body").catch(() => "")) ?? "";
-      if (bodyText.trim().length > 50) {
-        await page.waitForTimeout(this.acceptSettleDelayMs);
-        return true;
-      }
-      await page.waitForTimeout(pollMs);
+      // Settle briefly so dynamic content finishes rendering.
+      await page.waitForLoadState("networkidle", { timeout: this.acceptSettleDelayMs }).catch(() => undefined);
+      return true;
+    } catch {
+      return false;
     }
-
-    return false;
   }
 
   private async classifyAndAct(
@@ -190,9 +257,12 @@ export class GmailAcceptExecutor implements GmailInvitationAccepter {
 
       case "NEEDS_CONFIRM": {
         const btnText = await confirmBtn!.textContent().catch(() => "");
-        logger.info({ btnText: btnText?.trim(), pageUrl }, "GmailAcceptExecutor: CONTINUE_CLICKED");
+        logger.info({ btnText: btnText?.trim(), pageUrl }, "GmailAcceptExecutor: clicking confirm button");
         await confirmBtn!.click();
+
+        // Wait for the page to navigate / update after click.
         await page.waitForLoadState("domcontentloaded", { timeout: this.acceptPageTimeoutMs }).catch(() => undefined);
+        await page.waitForURL((u) => u.href !== pageUrl, { timeout: 5000 }).catch(() => undefined);
 
         const ready = await this.waitForAcceptPageReady(page);
         if (!ready) {
@@ -234,7 +304,6 @@ export class GmailAcceptExecutor implements GmailInvitationAccepter {
     }
   }
 
-  /** Finds the first visible Accept / Continue / Confirm button or link. */
   private async findConfirmButton(page: Page): Promise<import("playwright").Locator | null> {
     const buttonLoc = page.getByRole("button", { name: CONFIRM_BUTTON_NAMES }).first();
     if ((await buttonLoc.count().catch(() => 0)) > 0) return buttonLoc;
@@ -257,19 +326,23 @@ export class GmailAcceptExecutor implements GmailInvitationAccepter {
   // ---------------------------------------------------------------------------
 
   /**
-   * Opens campaignsUrl in a new tab and waits for the campaigns table to be ready.
-   * If Google redirects to Overview, clicks the left-nav Campaigns item and retries.
-   * Returns { ready, screenshotPath }.
+   * Opens (or reuses via BrowserTabManager) the campaigns page and waits until
+   * the table is ready. Supports the Part 9 direct-open flow.
    */
   private async openAndWaitForCampaignsPage(
-    context: BrowserContext,
+    tabManager: BrowserTabManager,
     campaignsUrl: string,
+    customerIdDigits: string,
   ): Promise<{ ready: boolean; screenshotPath: string | null }> {
     let tab: Page | null = null;
     try {
-      tab = await context.newPage();
-      await tab.goto(campaignsUrl, { waitUntil: "domcontentloaded", timeout: this.campaignsPageTimeoutMs });
-      logger.info({ campaignsUrl }, "GmailAcceptExecutor: campaigns tab opened");
+      tab = await tabManager.getOrCreateCampaignTab(
+        campaignsUrl,
+        customerIdDigits,
+        "domcontentloaded",
+        this.campaignsPageTimeoutMs,
+      );
+      logger.info({ campaignsUrl }, "GmailAcceptExecutor: campaigns tab ready");
 
       const ready = await this.waitForCampaignsPageReady(tab);
       if (ready) return { ready: true, screenshotPath: null };
@@ -283,27 +356,17 @@ export class GmailAcceptExecutor implements GmailInvitationAccepter {
     }
   }
 
-  /**
-   * Waits for the Google Ads campaigns table to appear on `page`.
-   *
-   * Flow:
-   *   1. Wait for domcontentloaded.
-   *   2. Poll until campaigns-table UI or campaigns URL is confirmed.
-   *   3. Settle delay.
-   *   4. If still on Overview, click left-nav Campaigns → Campaigns and repeat.
-   *   5. Up to CAMPAIGNS_NAV_RETRY_LIMIT retries.
-   */
   private async waitForCampaignsPageReady(page: Page): Promise<boolean> {
     for (let attempt = 0; attempt < CAMPAIGNS_NAV_RETRY_LIMIT; attempt++) {
       const found = await this.pollForCampaignsUi(page);
 
       if (found) {
-        await page.waitForTimeout(this.campaignsSettleDelayMs);
+        // Settle: wait for network to quiet down so the table data is fully loaded.
+        await page.waitForLoadState("networkidle", { timeout: this.campaignsSettleDelayMs }).catch(() => undefined);
         logger.info({ url: page.url(), attempt }, "GmailAcceptExecutor: campaigns page ready");
         return true;
       }
 
-      // Not yet on campaigns — try clicking the left-nav Campaigns link.
       const clicked = await this.clickCampaignsNavItem(page);
       if (!clicked) {
         logger.warn({ url: page.url(), attempt }, "GmailAcceptExecutor: campaigns nav item not found");
@@ -317,25 +380,25 @@ export class GmailAcceptExecutor implements GmailInvitationAccepter {
     return false;
   }
 
-  /**
-   * Polls until the campaigns table UI appears or the URL confirms we are on the
-   * campaigns list. Returns true when ready, false on timeout.
-   */
   private async pollForCampaignsUi(page: Page): Promise<boolean> {
     const deadline = Date.now() + this.campaignsPageTimeoutMs;
-    const pollMs = 2000;
+    const pollMs = 1500;
 
     while (Date.now() < deadline) {
-      // URL-based check: already on campaigns list URL.
       if (CAMPAIGNS_URL_PATTERN.test(page.url())) {
-        // Confirm page title or table is visible.
         const title = await page.title().catch(() => "");
         if (/campaigns/i.test(title)) return true;
 
-        // Check for campaigns table DOM elements.
         for (const sel of CAMPAIGNS_TABLE_SELECTORS) {
-          if ((await page.locator(sel).first().isVisible().catch(() => false))) return true;
+          if (await page.locator(sel).first().isVisible({ timeout: 500 }).catch(() => false)) return true;
         }
+      }
+
+      try {
+        // Use waitForSelector instead of polling timeout for better responsiveness.
+        await page.waitForSelector(CAMPAIGNS_TABLE_SELECTORS[0], { timeout: pollMs }).catch(() => undefined);
+      } catch {
+        // continue loop
       }
 
       await page.waitForTimeout(pollMs);
@@ -344,12 +407,7 @@ export class GmailAcceptExecutor implements GmailInvitationAccepter {
     return false;
   }
 
-  /**
-   * Attempts to click the Campaigns navigation item in the Google Ads left nav.
-   * Returns true if a click was dispatched.
-   */
   private async clickCampaignsNavItem(page: Page): Promise<boolean> {
-    // Prefer an explicit campaigns href link.
     for (const selector of CAMPAIGNS_NAV_SELECTORS) {
       const loc = page.locator(selector).filter({ hasText: /^Campaigns$/i }).first();
       if ((await loc.count().catch(() => 0)) > 0) {
@@ -358,7 +416,6 @@ export class GmailAcceptExecutor implements GmailInvitationAccepter {
       }
     }
 
-    // Fallback: any visible link/button with exact text "Campaigns".
     const fallback = page.getByRole("link", { name: /^Campaigns$/i }).first();
     if ((await fallback.count().catch(() => 0)) > 0) {
       await fallback.click({ timeout: 8000 }).catch(() => undefined);

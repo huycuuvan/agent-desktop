@@ -43,6 +43,12 @@ const envSchema = z.object({
   GMAIL_CAMPAIGNS_PAGE_TIMEOUT_MS: z.coerce.number().int().positive().default(120000),
   GMAIL_CAMPAIGNS_SETTLE_DELAY_MS: z.coerce.number().int().positive().default(5000),
   TELEGRAM_BOT_USERNAME: z.string().optional(),
+  TELEGRAM_POLL_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(30),
+  TELEGRAM_POLL_RETRY_DELAY_MS: z.coerce.number().int().positive().default(5000),
+  TELEGRAM_ORCHESTRATION_ENABLED: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((value) => value === "true"),
 });
 
 export type Env = z.infer<typeof envSchema>;

@@ -19,7 +19,18 @@ export function mapAccountResultToSnapshotInput(result: GoogleAdsAccountReadResu
     fromDate: result.fromDate,
     toDate: result.toDate,
     googleAdsDateLabel: result.googleAdsDateLabel,
-    campaigns: result.campaigns.map((row) => ({
+    campaigns: (() => {
+      const seen = new Set<string>();
+      return result.campaigns.filter((row) => {
+        const key = buildCampaignKey(result.customerId, row);
+        if (seen.has(key)) {
+          console.warn(`[snapshotMapper] Duplicate campaignKey skipped: ${key}`);
+          return false;
+        }
+        seen.add(key);
+        return true;
+      });
+    })().map((row) => ({
       campaignKey: buildCampaignKey(result.customerId, row),
       campaignName: row.campaignName,
       budget: row.budget,
@@ -52,6 +63,17 @@ export function buildCollectorRunInput(
     providerCode,
     dateMode,
     rawJson: JSON.stringify(results),
-    accounts: results.map(mapAccountResultToSnapshotInput),
+    accounts: (() => {
+      const seen = new Set<string>();
+      return results.filter((r) => {
+        const key = r.customerId ?? r.accountName ?? "";
+        if (seen.has(key)) {
+          console.warn(`[snapshotMapper] Duplicate account skipped: customerId=${r.customerId}`);
+          return false;
+        }
+        seen.add(key);
+        return true;
+      });
+    })().map(mapAccountResultToSnapshotInput),
   };
 }

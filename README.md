@@ -232,8 +232,31 @@ Accepted Telegram command forms (set `GMAIL_WEB_INTAKE_ENABLED=true` to enable):
 ```
 /accept_mcc 537-706-1556          # direct command with id
 /accept_mcc 5377061556            # plain 10-digit form
+/accept_mcc@botname 537-706-1556  # group chat with @botname suffix
 @bot 537-706-1556                 # @mention with id
 /accept_mcc                       # reply to provider's message — id parsed from reply
+@bot /accept_mcc 537-706-1556     # mention-then-command (Privacy Mode OFF group format)
+```
+
+> **Group chat note:** Telegram appends `@botname` to commands sent in group
+> chats (e.g. `/accept_mcc@mybot`). The parser handles this automatically.
+> For the bot to see group messages, **Privacy Mode must be OFF** in
+> `@BotFather → Bot Settings → Group Privacy → Disable`.
+> The bot always replies to the originating `chat.id` — responses appear in
+> the same chat (group or private) that sent the command.
+
+Collector commands (no Gmail intake — runs pipeline directly):
+
+```
+/check                            # run Collector → Snapshot → Sheets → Telegram summary
+/check_now                        # same
+/run_collector                    # same
+```
+
+Utility commands:
+
+```
+/whoami                           # returns the current chat.id and chat.type (useful for .env setup)
 ```
 
 New env vars (all optional / safe defaults):
@@ -265,13 +288,78 @@ Safety rules enforced by the `GmailIntakeUseCase`:
 - Every intake attempt is logged to `gmail_invitation_intake_logs` (SQLite)
   with full status, reason, matched subject, and screenshot path on failure.
 
+## Telegram Orchestration (Phase 7)
+
+When `TELEGRAM_ORCHESTRATION_ENABLED=true`, a successful `/accept_mcc` command automatically continues into the full pipeline: Collector → Snapshot → Google Sheets Sync → Telegram summary. No extra command needed.
+
+```bash
+pnpm telegram:bot                                          # long-poll listener (Phase 6 + 7)
+pnpm telegram:orchestrate -- --mcc 362-758-7499           # one-shot CLI run
+```
+
+### Browser tab management
+
+```bash
+pnpm tabs:list                    # list all open tabs per profile with type classification
+pnpm tabs:cleanup -- --dry-run    # show what would be closed (duplicate campaigns + blank tabs)
+pnpm tabs:cleanup                 # close duplicate campaign tabs + blank/chrome tabs safely
+```
+
+`pnpm tabs:cleanup` never closes: Gmail tabs, Google Sheets tabs, or the last remaining Campaign tab for any account. Only duplicate Campaign tabs (same `ocid`/`customerId`) and blank / `chrome://` tabs are closed.
+
+Step-by-step Telegram output:
+
+```
+Searching for invitation: 362-758-7499...
+
+Invitation status: ALREADY_ACCEPTED
+Campaigns page ready: true
+Campaigns: https://ads.google.com/aw/campaigns?ocid=...
+
+Running collector...
+
+Pipeline completed ✅
+
+Run: #17
+Accounts: 3
+Campaigns: 5
+Failed accounts: 0
+
+Sheets:
+- Appended: 0
+- Updated: 1
+- Skipped: 4
+
+Diff:
+- New: 0
+- Removed: 0
+- Status changed: 0
+- Budget changed: 1
+- Cost changed: 0
+- Metric changed: 0
+```
+
+New env var:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `TELEGRAM_ORCHESTRATION_ENABLED` | `false` | When `true`, a successful `/accept_mcc` runs the full pipeline automatically. When `false`, Phase 6 intake-only behavior is preserved. |
+
+Safety rules:
+- Only continues to the pipeline after `ACCEPTED` or `ALREADY_ACCEPTED` — all other statuses stop after Step 2.
+- Overlapping orchestration runs are rejected with a Telegram warning.
+- A collector failure is reported and stops the pipeline; the Telegram bot stays alive.
+- A Sheets sync failure reports a partial-success summary; it does not crash the bot.
+- A Telegram send failure during any step is logged but never aborts the run.
+- The pipeline always runs as a one-shot (not via the `AgentScheduler`).
+
 ## Project status
 
-Phases 1–5 are complete. Phase 6 is **IN PROGRESS** — implementation and unit
-tests are complete (180/180 passing), but live end-to-end acceptance for the
-ALREADY_ACCEPTED and ACCEPTED flows is still pending. See
-[PROJECT_STATUS.md](PROJECT_STATUS.md) for the full per-phase writeup, known
-limitations, and the next live test to run.
+Phases 1–7 are complete and live-verified. See [PROJECT_STATUS.md](PROJECT_STATUS.md)
+for the full per-phase writeup, verified behaviors, known limitations, and the
+Phase 8 backlog (Unified Bot Daemon Scheduler).
+
+**Recommended tag:** `v0.7.0`
 
 ## How to run tests
 
@@ -309,6 +397,7 @@ the full table with defaults. Summary:
 - `DEFAULT_ADSPOWER_PROFILE_ID` — optional; searched first when looking for an open Gmail tab.
 - `GMAIL_SEARCH_TIMEOUT_MS` / `GMAIL_ACCEPT_TIMEOUT_MS` — timeouts for the Gmail search and accept steps (defaults: `60000` / `90000`).
 - `TELEGRAM_BOT_USERNAME` — optional; bot username (no `@`) for recognizing `@mention` commands.
+- `TELEGRAM_ORCHESTRATION_ENABLED` — `false` (default); when `true`, a successful `/accept_mcc` automatically continues into the full Collector → Snapshot → Sheets Sync → Telegram summary pipeline.
 
 ## Meaning of output fields
 

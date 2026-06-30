@@ -62,6 +62,10 @@ export class GoogleAdsCollectorRunner implements CollectorRunner {
     const allGoogleAdsTabs: GoogleAdsTab[] = [];
     const allAccountResults: GoogleAdsAccountReadResult[] = [];
 
+    // Deduplicate by customerId across all profiles — same account must never be
+    // collected twice in one run (prevents duplicate campaign rows in the snapshot).
+    const seenCustomerIds = new Set<string>();
+
     for (const { profile, tabs } of results) {
       console.log(`\nProfile: ${profile.profileName} (${profile.profileId})`);
       if (tabs.length === 0) {
@@ -79,17 +83,35 @@ export class GoogleAdsCollectorRunner implements CollectorRunner {
         console.log("  Google Ads tabs:");
         console.log(JSON.stringify(googleAdsTabs, null, 2));
 
+        // Deduplicate by customerId — keep first occurrence across all profiles.
+        const uniqueTabs: GoogleAdsTab[] = [];
         for (const tab of googleAdsTabs) {
+          const key = tab.customerId ?? tab.url;
+          if (seenCustomerIds.has(key)) {
+            logger.warn(
+              { profileId: profile.profileId, customerId: tab.customerId, url: tab.url },
+              "Duplicate Google Ads tab skipped",
+            );
+            console.log(`  -> SKIPPED duplicate tab: customerId=${tab.customerId} url=${tab.url}`);
+            continue;
+          }
+          seenCustomerIds.add(key);
+          uniqueTabs.push(tab);
+        }
+
+        for (const tab of uniqueTabs) {
           console.log(`  -> Collecting tab: accountName=${tab.accountName} customerId=${tab.customerId} url=${tab.url}`);
         }
 
-        const accountResults = await collectGoogleAdsCampaignsUseCase.execute(
-          profile,
-          googleAdsTabs,
-          env.WATCH_PROVIDER_CODE,
-          env.GOOGLE_ADS_DATE_MODE,
-        );
-        allAccountResults.push(...accountResults);
+        if (uniqueTabs.length > 0) {
+          const accountResults = await collectGoogleAdsCampaignsUseCase.execute(
+            profile,
+            uniqueTabs,
+            env.WATCH_PROVIDER_CODE,
+            env.GOOGLE_ADS_DATE_MODE,
+          );
+          allAccountResults.push(...accountResults);
+        }
       }
 
       await prisma.profileScan.create({

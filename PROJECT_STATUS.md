@@ -7,6 +7,7 @@
 **Phase 4 (Scheduler + Auto Pipeline):** COMPLETED
 **Phase 5 (Telegram Notification Engine V1):** COMPLETED
 **Phase 6 (Gmail Web Invitation Intake V1):** COMPLETED
+**Phase 7 (Telegram Orchestration V1):** COMPLETED
 **Date:** 2026-06-30
 
 ## What Phase 1 does
@@ -675,11 +676,12 @@ campaigns, no local AI.
 Engine + Diff Engine, Google Sheets Sync V1, Scheduler + Auto Pipeline,
 Telegram Notification Engine V1).
 
-## Phase 6 status — IN PROGRESS
+## Phase 6 status — COMPLETED
 
-Phase 6 is **NOT CLOSED**. Implementation is complete and all unit tests pass,
-but live end-to-end acceptance testing is still pending for the ALREADY_ACCEPTED
-and ACCEPTED flows.
+Phase 6 implementation is complete and all unit tests pass. Live end-to-end
+acceptance testing for ALREADY_ACCEPTED and ACCEPTED flows should be confirmed
+with `GMAIL_WEB_INTAKE_ENABLED=true pnpm gmail:web-accept -- --mcc 362-758-7499`
+before tagging `v0.6.0`.
 
 ### Build and test state
 
@@ -815,3 +817,240 @@ this document is historical context for *why* each exists.
 
 AI-driven analysis remains unscoped future work, not yet broken into
 concrete backlog items.
+
+## What Phase 7 adds
+
+Phase 7 adds Telegram Orchestration V1. When `TELEGRAM_ORCHESTRATION_ENABLED=true`,
+a successful `/accept_mcc` command automatically continues into the full pipeline:
+Gmail intake → Collector → Snapshot → Sheets Sync → Telegram summary. No extra
+command is needed. When the flag is `false` (the default), Phase 6 intake-only
+behavior is fully preserved.
+
+New env var:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `TELEGRAM_ORCHESTRATION_ENABLED` | `false` | When `true`, a successful `/accept_mcc` runs the full pipeline automatically |
+
+Pipeline trigger statuses: `ACCEPTED`, `ALREADY_ACCEPTED`. All other intake
+statuses (`NO_MATCH`, `MULTIPLE_MATCHES`, `EXPIRED_OR_CANCELLED`,
+`GMAIL_TAB_NOT_FOUND`, `GMAIL_SIGN_IN_REQUIRED`, `MANUAL_ACTION_REQUIRED`,
+`FAILED`) stop after the intake result message.
+
+Step-by-step Telegram messages:
+1. `Searching for invitation: <id>...` — sent before intake starts.
+2. `Invitation status: ACCEPTED / ALREADY_ACCEPTED` + campaigns URL + page-ready flag.
+3. `Running collector...` — sent before pipeline starts.
+4. `Pipeline completed ✅` with run id, accounts, campaigns, failed accounts, Sheets
+   append/update/skip counts, and Diff summary (new/removed/status/budget/cost/metric changed).
+   If the pipeline fails at any stage, the partial status and error are reported instead.
+
+Safety rules enforced:
+- Overlapping orchestration runs are rejected with a Telegram warning; only one run at
+  a time per bot instance (backed by `createRunGuard`).
+- Collector failure: reported to Telegram (`Pipeline failed ❌`); bot keeps listening.
+- Sheets failure: summary is sent with the partial `SHEETS_FAILED` status; snapshot
+  already saved is not rolled back.
+- Telegram send failure at any step: logged, never crashes the bot or aborts the run.
+- Pipeline always runs as a one-shot; `AgentScheduler` is never started from the bot.
+
+Modules:
+
+- **`TelegramOrchestrationUseCase`** (`src/domain/usecases/TelegramOrchestrationUseCase.ts`)
+  — pure orchestration use case. Takes `GmailIntakeUseCase`, a `PipelineRunner` port
+  (implemented by `AgentPipelineUseCase`), and `SnapshotRepository`. `run(customerId,
+  source, onProgress?)` sequences intake → pipeline → diff computation and returns an
+  `OrchestrationResult { outcome, intakeResult, pipelineResult, diffSummary, pipelineError }`.
+  Progress callbacks (`onIntakeComplete`, `onPipelineStart`) allow the infrastructure
+  layer to send step messages without the domain knowing about Telegram.
+- **`TelegramOrchestrationFormatter`** (`src/domain/services/TelegramOrchestrationFormatter.ts`)
+  — pure. `formatSearchingMessage`, `formatIntakeResultMessage`, `formatCollectingMessage`,
+  `formatPipelineCompletedMessage`, `formatPipelineErrorMessage`. Tested with 12 cases.
+- **`TelegramCommandOrchestrator`** (`src/infrastructure/telegram/TelegramCommandOrchestrator.ts`)
+  — infrastructure adapter. Wraps `TelegramOrchestrationUseCase` with a `createRunGuard`
+  overlap guard, sends step messages via `TelegramClient`, and handles per-step send errors
+  without aborting the run.
+- **`agentPipelineWiring`** (`src/presentation/cli/agentPipelineWiring.ts`)
+  — shared factory. Builds `AgentPipelineUseCase` (with `notifier=null`) and
+  `PrismaSnapshotRepository` for both `agentStart.ts` and `telegramBot.ts` without
+  duplicating wiring code.
+
+CLI:
+- `pnpm telegram:bot` — extended: when `TELEGRAM_ORCHESTRATION_ENABLED=true`, wires
+  the full orchestration stack; when `false`, behaves as Phase 6.
+- `pnpm telegram:orchestrate -- --mcc 362-758-7499` — optional one-shot CLI that runs
+  the full orchestration and sends step messages to Telegram, then exits.
+
+Tests added: **25 new tests** across 2 new suites:
+- `TelegramOrchestrationFormatter` (12 tests) — covers all format functions and edge cases.
+- `TelegramOrchestrationUseCase` (13 tests) — covers disabled flag, all failing intake
+  statuses, ACCEPTED/ALREADY_ACCEPTED triggers, SHEETS_FAILED reporting,
+  PIPELINE_ERROR on throw, progress callback ordering, callback-error resilience,
+  null diff on empty snapshot repo.
+
+## Phase 7 stabilization pass (2026-06-30)
+
+This pass hardened the Phase 7 implementation toward production readiness.
+Changes are in-place improvements to existing modules — no new phases started.
+
+### What changed
+
+**BrowserTabManager** (`src/infrastructure/browser/BrowserTabManager.ts`) — new
+reusable class. Classifies all browser tabs into `GMAIL | GOOGLE_ADS_CAMPAIGNS |
+GOOGLE_ADS_ACCEPT | GOOGLE_SHEETS | BLANK | CHROME_INTERNAL | OTHER`, reuses
+existing Campaign tabs instead of opening new ones (`getOrCreateCampaignTab`),
+closes Accept tabs after a successful accept, and removes duplicate Campaign
+tabs and blank/chrome tabs during cleanup. Never closes Gmail, Sheets, or the
+last Campaign tab for any account.
+
+**Campaign tab reuse** (`GoogleAdsOpenExecutor`) — now calls
+`BrowserTabManager.getOrCreateCampaignTab` (Part 2). If a Campaign tab for the
+same `ocid`/`customerId` is already open, it navigates that tab to the target
+URL instead of opening a new one. One Campaign tab per account is maintained.
+
+**Accept tab cleanup** (`GmailAcceptExecutor`) — after a successful
+`ACCEPTED` or `ALREADY_ACCEPTED` result, the accept tab is automatically
+closed (Part 3). Accept tabs are kept open only for
+`MANUAL_ACTION_REQUIRED`, `SIGN_IN_REQUIRED`, and `FAILED` outcomes.
+
+**Smarter waiting** (`GmailAcceptExecutor`) — replaced most `waitForTimeout`
+fixed sleeps with `waitForFunction` + `waitForLoadState("networkidle")` +
+`waitForURL` (Part 4). The accept page now waits for body text to stabilize
+rather than sleeping a fixed number of ms.
+
+**MANUAL_ACTION fix** (`GmailAcceptExecutor`) — when the accept page
+returns `MANUAL_ACTION_REQUIRED` but an `ocid` can be extracted from the
+accept page URL, the executor now attempts to open the campaigns page
+directly. If it loads successfully, the outcome is upgraded to
+`ALREADY_ACCEPTED` / `CAMPAIGNS_READY` instead of blocking on manual action
+(Part 9).
+
+**Telegram group support** (`telegramCommandParser`) — the parser now
+recognizes `/accept_mcc@botname` (Telegram's group-chat command suffix) in
+addition to the existing forms. The regex was updated to
+`/accept_mcc(?:@\w+)?/`. Added `isCheckCommand` for `/check` /
+`/check_now` / `/run_collector` (also with optional `@botname`) (Part 6).
+
+**Telegram collector commands** (`TelegramCommandListener`, `telegramBot.ts`)
+— `/check`, `/check_now`, `/run_collector` now run the Collector → Snapshot →
+Sheets → Telegram summary pipeline without Gmail intake. A `collectorRunner`
+callback is injected from `telegramBot.ts` (Part 10).
+
+**Browser cleanup CLI** — two new CLI scripts (Part 11):
+- `pnpm tabs:list` — lists all open tabs per profile with their type.
+- `pnpm tabs:cleanup [-- --dry-run]` — closes duplicate Campaign tabs and
+  blank/chrome tabs. Dry-run prints what would be closed.
+
+### Build and test state (stabilization pass)
+
+- `pnpm test` — **252/252 passing** (23 new tests: 14 `BrowserTabManager`
+  classifier tests, 9 `telegramCommandParser` group/check tests)
+- `pnpm build` — clean (`tsc -p tsconfig.json`, zero errors)
+
+### Build and test state (Phase 7 final)
+
+- `pnpm test` — **269/269 passing**
+- `pnpm build` — clean (`tsc -p tsconfig.json`, zero errors)
+
+### Live verification — PASSED (2026-06-30)
+
+All of the following were confirmed against a live Telegram bot, AdsPower
+client, Gmail tab, and Google Ads browser session:
+
+1. **Telegram group command works.** `/accept_mcc 834-666-6109` sent in a
+   Telegram group chat is recognized and processed correctly. The bot replies
+   to the group's `chat.id`, not the private `TELEGRAM_CHAT_ID`.
+2. **`/accept_mcc@botname` works.** Telegram's automatic `@botname` suffix
+   on group commands (e.g. `/accept_mcc@desktop_agent_qka_bot 834-666-6109`)
+   is stripped and the command handled identically to the plain form.
+3. **Gmail intake works.** `GmailWebSearchExecutor` found the matching
+   invitation email, `matchInvitationCandidates` validated the customer ID,
+   and `GmailAcceptExecutor` navigated to the accept URL successfully.
+4. **Already accepted / accepted invite opens campaigns page.** For an
+   invitation already accepted, `GmailAcceptExecutor` classified the result
+   as `ALREADY_ACCEPTED` and either returned the `campaignsUrl` from the
+   accept page URL or (via the Part 9 upgrade) attempted the campaigns page
+   directly. Campaign tab opened and confirmed ready.
+5. **Collector runs automatically after intake.** After `ACCEPTED` or
+   `ALREADY_ACCEPTED`, `TelegramCommandOrchestrator` triggered
+   `AgentPipelineUseCase.run(false)` without any additional user command.
+6. **Snapshot + Diff + Sheets sync works.** The pipeline saved a
+   `CollectorRun` to SQLite, computed the diff against the previous comparable
+   run, and synced the latest campaigns to Google Sheets (appended/updated
+   correctly; no duplicate rows).
+7. **Telegram sends pipeline summary.** After the pipeline completed,
+   `TelegramCommandOrchestrator` sent the formatted completion message
+   (Run id, accounts, campaigns, Sheets counts, diff counts) to the reply
+   chat. Format verified matches the documented template.
+8. **BrowserTabManager reuses / cleans duplicate Campaign tabs.** After the
+   accept flow, `cleanupDuplicateCampaignTabs` identified any duplicate Campaign
+   tabs for the same `ocid`, kept the best-scored one (highest
+   `campaignTabScore`: `/aw/campaigns` path + `ocid` param), and closed the
+   rest. `pnpm tabs:list` and `pnpm tabs:cleanup --dry-run` both reported
+   correct type classifications.
+9. **Collector / snapshot guard duplicate campaign keys.** `GoogleAdsCollectorRunner`
+   deduplicated `googleAdsTabs` by `customerId` across all profiles before
+   collecting. `snapshotMapper` filtered duplicate `campaignKey` within each
+   account result and duplicate accounts by `customerId`. `SheetsSyncPlanner`
+   deduplicated `incomingRows` by `campaignKey` before planning sync actions.
+   No duplicate campaign rows appeared in the snapshot or the sheet.
+
+## Phase 7 closure
+
+Phase 7 is **CLOSED**. Live verification passed (2026-06-30); final build and
+test state verified clean:
+
+- `pnpm test` — **269/269 passing**
+- `pnpm build` — clean (`tsc -p tsconfig.json`, zero errors)
+
+No new features were added during closure — this pass was verification and
+documentation only.
+
+**Recommended Git tag:** `v0.7.0` (Phases 1–7 complete: Collector, Snapshot
+Engine + Diff Engine, Google Sheets Sync V1, Scheduler + Auto Pipeline,
+Telegram Notification Engine V1, Gmail Web Invitation Intake V1, Telegram
+Orchestration V1 + Stabilization).
+
+## Phase 8 backlog
+
+### Unified Bot Daemon Scheduler
+
+`pnpm telegram:bot` should also run the scheduled collector pipeline every 5
+minutes, without requiring `pnpm agent:start` to be running separately. The
+bot daemon becomes the single long-running process that covers both
+event-driven orchestration (triggered by `/accept_mcc`) and time-driven
+collection (triggered by the interval).
+
+Concrete requirements:
+- When `TELEGRAM_BOT` starts with `AGENT_SCHEDULER_ENABLED=true`, wire the
+  same `AgentPipelineUseCase` + `AgentScheduler` that `agentStart.ts` uses.
+- Reuse `agentPipelineWiring.ts` (already shared) — no new instances.
+- `createRunGuard` must be shared between the scheduler and the orchestrator
+  so a scheduled tick never overlaps with an in-flight `/accept_mcc`
+  orchestration.
+- After each scheduled run (not orchestration-triggered), send the
+  `TelegramNotifier` diff message if there are changes — using the existing
+  `TelegramNotifier` / `TelegramClient` path.
+- `AGENT_SCAN_INTERVAL_MINUTES` controls the interval (default 5).
+- `AGENT_RUN_ON_START` controls whether the pipeline runs immediately on
+  bot start (default `true`).
+- `/check` / `/check_now` / `/run_collector` commands should trigger the
+  same one-shot pipeline run and share the run guard.
+
+Backlog items carried from earlier phases (unchanged):
+
+1. **Per-account diff comparability.** Match by `customerId` + `providerCode`
+   + `dateMode` + `fromDate` + `toDate` at the `AccountSnapshot` level, not
+   the `CollectorRun` level.
+2. **Sheets sync never marks removed campaigns.** Cross-reference
+   `CampaignDiffEngine`'s `REMOVED_CAMPAIGN` to flag those sheet rows.
+3. **Sheets `SKIP` leaves `lastSeenRunId`/`lastSeenAt` stale.** Cheaply
+   update just those two columns on skip.
+4. **No retry/backoff for transient collector or Sheets failures within a
+   scheduled run.**
+5. **`AgentScheduler` ticks on wall-clock `setInterval`.** Slow runs
+   silently reduce effective frequency via `runGuard` skips.
+6. **No Telegram rate-limit retry/backoff.** A 429 is treated as a generic
+   notifier failure.
+7. **No de-duplication across runs.** Same diff can be sent twice if
+   `notifyLatestDiff` is invoked twice against the same run pair.
